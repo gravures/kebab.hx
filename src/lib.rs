@@ -7,7 +7,9 @@ use abi_stable::{
     RMut,
 };
 use config::{ColorAttribute, SrgbaTuple, TermConfig};
-use portable_pty::{Child, CommandBuilder, NativePtySystem, PtyPair, PtySize, PtySystem};
+use portable_pty::{
+    Child, CommandBuilder, MasterPty, NativePtySystem, PtyPair, PtySize, PtySystem,
+};
 use std::{
     io::{Read, Write},
     sync::{
@@ -64,7 +66,7 @@ struct PtyProcess {
     cancellation_token_sender: Sender<()>,
     command_sender: Sender<u8>,
     async_receiver: Arc<Mutex<mpsc::UnboundedReceiver<String>>>,
-    pty_system: PtyPair,
+    master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync + 'static>,
     writer: WriterWrapper,
 }
@@ -115,7 +117,7 @@ impl PtyProcess {
     // and those bounds checks should be implemented on
     // the conversion
     pub fn resize(&mut self, rows: usize, cols: usize) -> RResult<FFIValue, RBoxError> {
-        match self.pty_system.master.resize(PtySize {
+        match self.master.resize(PtySize {
             rows: rows as u16,
             cols: cols as u16,
             pixel_width: 0,
@@ -716,6 +718,13 @@ fn spawn_in_pty(mut cmd: CommandBuilder) -> PtyProcess {
 
     let child = pair.slave.spawn_command(cmd).unwrap();
 
+    // Drop our copy of the slave endpoint now that the child owns one. Holding
+    // it here keeps the master from ever reaching EOF when the child exits, so
+    // the reader thread below would block in read() forever and no exit signal
+    // could reach the plugin (see the async-try-read-line EOF arm).
+    let PtyPair { master, slave } = pair;
+    drop(slave);
+
     // Read the output in another thread.
     // This is important because it is easy to encounter a situation
     // where read/write buffers fill and block either your process
@@ -724,8 +733,8 @@ fn spawn_in_pty(mut cmd: CommandBuilder) -> PtyProcess {
 
     let (cancellation_token_sender, cancellation_token_receiver) = channel::<()>();
 
-    let mut reader = pair.master.try_clone_reader().unwrap();
-    let mut writer = WriterWrapper::new(pair.master.take_writer().unwrap());
+    let mut reader = master.try_clone_reader().unwrap();
+    let mut writer = WriterWrapper::new(master.take_writer().unwrap());
 
     let writer_clone = writer.clone();
 
@@ -798,7 +807,13 @@ fn spawn_in_pty(mut cmd: CommandBuilder) -> PtyProcess {
         // data to the stdin of the child in a different thread.
         std::thread::spawn(move || loop {
             while let Ok(command) = command_receiver.recv() {
-                writer.write_all(&[command]).unwrap();
+                // Writing to the master fails (EIO) once no slave endpoint is
+                // open anywhere, i.e. after the child exits: treat it as the
+                // end of the writer instead of panicking a thread inside a
+                // terminal application.
+                if writer.write_all(&[command]).is_err() {
+                    break;
+                }
             }
 
             break;
@@ -811,7 +826,7 @@ fn spawn_in_pty(mut cmd: CommandBuilder) -> PtyProcess {
         command_sender,
         // output_receiver: rx,
         async_receiver: Arc::new(Mutex::new(async_receiver)),
-        pty_system: pair,
+        master,
         child,
         writer: writer_clone,
     }
