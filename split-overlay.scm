@@ -26,7 +26,8 @@
   split-overlay-toggle!
   split-overlay-region
   split-overlay-render-native!
-  split-overlay-bg-style)
+  split-overlay-bg-style
+  split-overlay-anchor-view)
 
 ;; ------------------------------------------------------------------ types
 
@@ -154,6 +155,16 @@
       (pop-last-component-by-name! name)
       (let ([f (Overlay-on-close e)])
         (when f (f))))))
+
+;;@doc
+;; Get the anchor view for an overlay, if open.
+;;
+;; ```scheme
+;; (split-overlay-anchor-view name) -> (or/c ViewId #f)
+;; ```
+(define (split-overlay-anchor-view name)
+  (let ([e (%lookup name *overlays*)])
+    (and e (Overlay-anchor-view e))))
 
 ;;@doc
 ;; Toggle an overlay by running the appropriate open or close function.
