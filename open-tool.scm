@@ -20,6 +20,7 @@
 (require "helix/misc.scm") ; set-status!, helix-await-callback
 (require "helix/components.scm") ; style/Color/frame-set-string!/events
 (require "helix/static.scm") ; get-helix-cwd
+(require "helix/editor.scm") ; editor-focus
 (require "split-overlay.scm") ; open!/close! overlap, region, bg-style
 (require-builtin steel/ffi) ; ffi-vector, ffi-vector-ref, mutable-string
 (require-builtin steel/filesystem) ; path-exists?
