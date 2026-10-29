@@ -37,9 +37,9 @@
     vte/resize
     pty-resize!
     vte/reset-iterator!
-    vte/advance-iterator-and-update-cells!
-    vte/iter-x
-    vte/iter-y
+    vte/advance-run!
+    vte/iter-run-x
+    vte/iter-run-y
     vte/iter-cell-reverse?
     vte/empty-cell
     term/color-attribute-set!
@@ -151,11 +151,11 @@
 ;; NOTE: there is no view-exists API to tell "anchor blurred" from "anchor
 ;; closed". An anchor split closed while released leaves a frozen, unreachable
 ;; tool, and no path in this file detects that case.
-(struct Tool (name vte pty rows cols str cell-fg cell-bg kill-switch released-to-helix))
+(struct Tool (name vte pty rows cols str cell-fg cell-bg kill-switch released-to-helix region))
 
 ;; Reused scratch: one string and two cell attributes per overlay, plus the two
 ;; rgb vectors and colors the style translation needs. The dylib overwrites
-;; them per cell, so nothing allocates in the paint loop.
+;; them per style-run, so nothing allocates in the paint loop.
 (define bg-attr (ffi-vector #f #f #f #f))
 (define fg-attr (ffi-vector #f #f #f #f))
 (define fg-scratch (Color/rgb 0 0 0))
@@ -245,6 +245,7 @@
 ;; The emulator and PTY match the box size: SIGWINCH makes the program repaint
 ;; at the new size. Runs before painting so this frame sees the resized grid.
 (define (%sync-size! state region)
+  (set-box! (Tool-region state) region)
   (let* ([w (area-width region)]
          [h (area-height region)])
     (unless (and (= w (unbox (Tool-cols state))) (= h (unbox (Tool-rows state))))
@@ -253,6 +254,8 @@
       (vte/resize (Tool-vte state) h w)
       (pty-resize! (Tool-pty state) h w))))
 
+;; Paint by style-run (cells sharing fg/bg/reverse): one frame-set-string! per
+;; run keeps a full repaint cheap. The run start is the cell's own column.
 (define (%render! state rect buffer)
   (let* ([region (split-overlay-region (Tool-name state) rect)]
          [x0 (area-x region)]
@@ -262,15 +265,15 @@
     (%sync-size! state region)
     (buffer/clear-with buffer region split-overlay-bg-style)
     (vte/reset-iterator! vte)
-    (while (vte/advance-iterator-and-update-cells! vte
+    (while (vte/advance-run! vte
             (Tool-str state)
             (Tool-cell-bg state)
             (Tool-cell-fg state))
       (%cell-style! style (Tool-cell-fg state) (Tool-cell-bg state)
         (vte/iter-cell-reverse? vte))
       (frame-set-string! buffer
-        (+ x0 (vte/iter-x vte))
-        (+ y0 (vte/iter-y vte))
+        (+ x0 (vte/iter-run-x vte))
+        (+ y0 (vte/iter-run-y vte))
         (Tool-str state)
         style))))
 
@@ -289,15 +292,61 @@
 
 ;; ------------------------------------------------------------------ input
 
+;; Press/release and scroll, re-encoded as SGR reports on the child's grid: the
+;; region origin shifts the screen coordinates into the overlay's own space,
+;; where the child believes its window starts at (1,1). Drag and plain motion
+;; are dropped -- no tool here needs them, and htop-style TUIs that enable
+;; mouse reporting themselves never miss them.
+;; No paint per mouse event: helix repaints the whole compositor per consumed
+;; event (~17 ms), and the child's output triggers a repaint when it arrives.
+(define (%forward-mouse! state event)
+  (let* ([region (unbox (Tool-region state))]
+         [cx (event-mouse-col event)]
+         [cy (event-mouse-row event)]
+         [x (if region (area-x region) 0)]
+         [y (if region (area-y region) 0)]
+         [w (if region (area-width region) 0)]
+         [h (if region (area-height region) 0)])
+    (define (inside?)
+      (and (>= cx x) (< cx (+ x w)) (>= cy y) (< cy (+ y h))))
+    (cond
+      ;; outside the overlay: helix keeps it (focus another split, select text)
+      [(not (inside?)) event-result/ignore]
+      [else
+        (let* ([kind (event-mouse-kind event)]
+               [button (cond [(= kind 0) 0] ; left
+                        [(= kind 1) 2] ; right
+                        [(= kind 2) 1] ; middle
+                        [(= kind 3) 0]
+                        [(= kind 4) 2]
+                        [(= kind 5) 1]
+                        [(= kind 10) 65] ; wheel down
+                        [(= kind 11) 64] ; wheel up
+                        [(= kind 12) 66] ; wheel left
+                        [(= kind 13) 67] ; wheel right
+                        [else #f])]
+               ;; release reports the same button with a lowercase terminator
+               [end (if (and (>= kind 3) (<= kind 5)) "m" "M")])
+          (if (not button)
+            event-result/consume-without-rerender ; drag / motion: swallowed, never forwarded
+            (begin
+              (pty-process-send-command (Tool-pty state)
+                (string-append "\x1b;[<" (number->string button) ";"
+                  (number->string (+ 1 (- cx x)))
+                  ";"
+                  (number->string (+ 1 (- cy y)))
+                  end))
+              event-result/consume-without-rerender)))])))
+
 ;; Keys go to the program ONLY while the tool has focus: the release chord gives
 ;; them back to helix (scroll, select, copy, command mode, the `:` prompt) while
 ;; the overlay stays rendered and the child keeps running.
 ;;
 ;; Kill-switch (child exit) still closes unconditionally, whichever mode is in.
-;; Mouse events are consumed and dropped.
+;; Mouse press/release and wheel go to the program; drag is swallowed.
 ;;
 ;; FIXME: alt loses its modifier on non-char keys (key-event-up? and friends match
-;; the key code only, components.rs:714); mouse needs a protocol chosen (XTerm).
+;; the key code only, components.rs:714).
 (define (%handle-event! state event)
   ;; kill-switch first: authoritative close on child exit, regardless of focus.
   (cond
@@ -349,7 +398,7 @@
           [(key-event-down? event) (send "\x1b;[B")]
           [(key-event-right? event) (send "\x1b;[C")]
           [(key-event-left? event) (send "\x1b;[D")]
-          [(mouse-event? event) event-result/consume]
+          [(mouse-event? event) (%forward-mouse! state event)]
           [(not (key-event? event)) event-result/ignore]
 
           ;; ctrl-chars: decode the byte the terminal actually sent via the
@@ -383,8 +432,8 @@
 ;; is pressed or focus moves to another split; the overlay stays up and the
 ;; child keeps running, so the program is resumed by pressing the chord again.
 ;;
-;; Mouse clicks are consumed, not forwarded. An unforwardable key (F-keys,
-;; Home/End) closes the overlay.
+;; Mouse press/release and wheel go to the program; drag does not. An
+;; unforwardable key (F-keys, Home/End) closes the overlay.
 ;;
 ;; #### Arguments
 ;; - `program` (`string?`) - executable name or path. If it contains `/`, treated
@@ -415,6 +464,7 @@
                  [tool (Tool "open-tool" vte pty (box 0) (box 0) (mutable-string)
                         (vte/empty-cell)
                         (vte/empty-cell)
+                        (box #f)
                         (box #f)
                         (box #f))])
             (split-overlay-open!

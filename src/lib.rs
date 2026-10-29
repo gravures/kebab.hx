@@ -224,6 +224,8 @@ fn create_module() -> FFIModule {
             screen_iterator: ScreenCellIterator { x: 0, y: 0 },
             last_cell: None,
             last_reverse: false,
+            run_x: 0,
+            run_y: 0,
             scroll_up_modifier: 0,
         })
         // Raw virtual terminal!
@@ -238,6 +240,8 @@ fn create_module() -> FFIModule {
             screen_iterator: ScreenCellIterator { x: 0, y: 0 },
             last_cell: None,
             last_reverse: false,
+            run_x: 0,
+            run_y: 0,
             scroll_up_modifier: 0,
         })
         .register_fn("vte/advance-bytes", VirtualTerminal::advance_bytes)
@@ -469,6 +473,90 @@ fn create_module() -> FFIModule {
                 }
             },
         )
+        // Batched sibling of vte/advance-iterator-and-update-cells!: instead of one
+        // visible cell per call, consume the maximal horizontal run of visible cells
+        // sharing (fg, bg, reverse) and write them into mut_str as one string. The
+        // style attrs are written once per run; run start coords land in run_x/run_y
+        // (read them via vte/iter-run-x / vte/iter-run-y AFTER a #t return). Invisible
+        // cells and wide-glyph continuation cells (both is_invisible) break the run;
+        // a wide glyph itself stays in the run and keeps its full multi-column string,
+        // so helix's per-char width advance keeps positions aligned.
+        .register_fn(
+            "vte/advance-run!",
+            |term: &mut VirtualTerminal, mut mut_str: RMut<'_, RString>, bg: FFIArg, fg: FFIArg| {
+                let size = term.terminal.get_size();
+                let (rows, cols) = (size.rows as i64 + term.scroll_up_modifier, size.cols);
+
+                // Find the next visible cell, same walk as the per-cell variant.
+                let first = loop {
+                    if term.screen_iterator.y >= rows {
+                        return false;
+                    }
+                    if term.screen_iterator.x >= cols {
+                        term.screen_iterator.x = 0;
+                        term.screen_iterator.y += 1;
+                        continue;
+                    }
+                    let cell = term.terminal.screen_mut().get_cell_scrollback(
+                        term.screen_iterator.x,
+                        term.screen_iterator.y as _,
+                    );
+                    term.screen_iterator.x += 1;
+                    match cell {
+                        Some(cell) if !is_invisible(cell) => break cell.clone(),
+                        _ => continue,
+                    }
+                };
+
+                term.run_x = term.screen_iterator.x - 1;
+                term.run_y = term.screen_iterator.y - term.scroll_up_modifier;
+
+                let attrs = first.attrs().to_owned();
+                term.last_reverse = attrs.reverse();
+
+                let mut_str = mut_str.get_mut();
+                mut_str.clear();
+                mut_str.push_str(first.str());
+
+                // Extend while cells stay visible and share (fg, bg, reverse).
+                while term.screen_iterator.x < cols {
+                    let cell = term.terminal.screen_mut().get_cell_scrollback(
+                        term.screen_iterator.x,
+                        term.screen_iterator.y as _,
+                    );
+                    match cell {
+                        Some(cell)
+                            if !is_invisible(cell)
+                                && cell.attrs().foreground() == attrs.foreground()
+                                && cell.attrs().background() == attrs.background()
+                                && cell.attrs().reverse() == attrs.reverse() =>
+                        {
+                            mut_str.push_str(cell.str());
+                            term.screen_iterator.x += 1;
+                        }
+                        _ => break,
+                    }
+                }
+
+                if let FFIArg::CustomRef(CustomRef { mut custom, .. }) = bg {
+                    if let Some(attr) = as_underlying_ffi_type::<TermColorAttribute>(custom.get_mut()) {
+                        attr.0 = attrs.background();
+                    }
+                }
+                if let FFIArg::CustomRef(CustomRef { mut custom, .. }) = fg {
+                    if let Some(attr) = as_underlying_ffi_type::<TermColorAttribute>(custom.get_mut()) {
+                        attr.0 = attrs.foreground();
+                    }
+                }
+                true
+            },
+        )
+        .register_fn("vte/iter-run-x", |term: &VirtualTerminal| {
+            term.run_x as isize
+        })
+        .register_fn("vte/iter-run-y", |term: &VirtualTerminal| {
+            term.run_y as isize
+        })
         .register_fn("vte/iter-x", |term: &VirtualTerminal| {
             term.screen_iterator.x
         })
@@ -496,6 +584,11 @@ fn create_module() -> FFIModule {
         })
         .register_fn("vte/empty-cell", || {
             TermColorAttribute(ColorAttribute::default())
+        })
+        // Steel has no reader for an ffi MutableString, so a caller that wants
+        // the text of a painted run has to go through here.
+        .register_fn("mutable-string-to-string", |s: RMut<'_, RString>| {
+            s.get().as_str().to_string()
         })
         .register_fn(
             "vte/iter-cell-bg-fg-set-attr!",
@@ -843,6 +936,8 @@ struct VirtualTerminal {
     scroll_up_modifier: i64,
     last_cell: Option<Cell>,
     last_reverse: bool,
+    run_x: usize,
+    run_y: i64,
 }
 
 struct ScreenCellIterator {
