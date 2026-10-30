@@ -145,7 +145,7 @@
 ;; NOTE: there is no view-exists API to tell "anchor blurred" from "anchor
 ;; closed". An anchor split closed while released leaves a frozen, unreachable
 ;; tool, and no path in this file detects that case.
-(struct Tool (name vte pty rows cols str cell-fg cell-bg kill-switch released-to-helix region))
+(struct Tool (name vte pty rows cols str cell-fg cell-bg kill-switch released-to-helix region cursor-kind))
 
 ;; Reused scratch: one string and two cell attributes per overlay, plus the two
 ;; rgb vectors and colors the style translation needs. The dylib overwrites
@@ -234,6 +234,20 @@
           (vte/advance-bytes (Tool-vte state) line)
           (%pump state)]))))
 
+;; ------------------------------------------------------------------ cursor
+;;
+;; The cursor callback runs without an engine context: helix calls it without
+;; setting CTX. It must not call ctx-bound helpers such as split-overlay-region;
+;; it reads the region cached by %sync-size! in Tool-region.
+;; Cursor shape for the tool is set from `editor.cursor-shape.insert` setting.
+(define (%cursor-kind)
+  (let ([v (get-config-option-value "cursor-shape.insert")])
+    (cond
+      [(equal? v "bar") "bar"]
+      [(equal? v "underline") "underline"]
+      [(equal? v "hidden") "hidden"]
+      [else "block"])))
+
 ;; ------------------------------------------------------------------ paint
 
 ;; The emulator and PTY match the box size: SIGWINCH makes the program repaint
@@ -271,18 +285,22 @@
         (Tool-str state)
         style))))
 
-;; While released, report no cursor: Compositor::cursor takes the topmost
-;; layer's cursor and stops, so the tool's caret would mask helix's own in the
-;; split you work in.
+;; While the keys are released to helix, the tool cursor is hidden:
+;; helix shows its own cursor in the split you work in.
+;; Compositor::cursor takes the topmost layer's cursor and stops,
+;; so the tool caret must not be reported then.
 (define (%cursor! state rect)
-  (if (unbox (Tool-released-to-helix state))
-    (list #f "hidden")
-    (let ([region (split-overlay-region (Tool-name state) rect)])
-      (if (vte/cursor-visible? (Tool-vte state))
-        (list (position (+ (area-y region) (vte/cursor-y (Tool-vte state)))
-               (+ (area-x region) (vte/cursor-x (Tool-vte state))))
-          "block")
-        (list #f "hidden")))))
+  (let ([region (unbox (Tool-region state))])
+    (if (and region
+         (not (unbox (Tool-released-to-helix state)))
+         (vte/cursor-visible? (Tool-vte state)))
+      (let ([kind (Tool-cursor-kind state)])
+        (if (equal? kind "hidden")
+          (list #f "hidden")
+          (list (position (+ (area-y region) (vte/cursor-y (Tool-vte state)))
+                 (+ (area-x region) (vte/cursor-x (Tool-vte state))))
+            kind)))
+      (list #f "hidden"))))
 
 ;; ------------------------------------------------------------------ input
 
@@ -321,9 +339,7 @@
                         [else #f])]
                ;; release reports the same button with a lowercase terminator
                [end (if (and (>= kind 3) (<= kind 5)) "m" "M")])
-          (if (not button)
-            ;; drag/motion: swallowed,
-            ;; never forwarded event-result/consume-without-rerender
+          (if button
             (begin
               (pty-process-send-command (Tool-pty state)
                 (string-append "\x1b;[<" (number->string button) ";"
@@ -331,7 +347,10 @@
                   ";"
                   (number->string (+ 1 (- cy y)))
                   end))
-              event-result/consume-without-rerender)))])))
+              event-result/consume-without-rerender)
+            ;; drag/motion: swallowed, no report is sent to the child
+            ;; the event is consumed without a rerender
+            event-result/consume-without-rerender))])))
 
 ;; Keys go to the program ONLY while the tool has focus: the release chord gives
 ;; them back to helix (scroll, select, copy, command mode, the `:` prompt) while
@@ -456,7 +475,8 @@
                         (vte/empty-cell)
                         (box #f)
                         (box #f)
-                        (box #f))])
+                        (box #f)
+                        (%cursor-kind))])
             (split-overlay-open!
               "open-tool"
               tool
