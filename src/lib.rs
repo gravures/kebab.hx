@@ -11,6 +11,7 @@ use portable_pty::{
     Child, CommandBuilder, MasterPty, NativePtySystem, PtyPair, PtySize, PtySystem,
 };
 use std::{
+    any::Any,
     io::{Read, Write},
     sync::{
         mpsc::{channel, Sender},
@@ -88,6 +89,53 @@ impl std::fmt::Display for PtyProcessError {
     }
 }
 
+#[derive(Debug)]
+struct PanicError {
+    name: &'static str,
+    payload: String,
+    backtrace: String,
+}
+
+impl PanicError {
+    fn new(name: &'static str, payload: Box<dyn Any + Send>) -> Self {
+        let payload = if let Some(message) = payload.downcast_ref::<&str>() {
+            (*message).to_string()
+        } else if let Some(message) = payload.downcast_ref::<String>() {
+            message.clone()
+        } else {
+            "unknown panic payload".to_string()
+        };
+
+        Self {
+            name,
+            payload,
+            backtrace: std::backtrace::Backtrace::force_capture().to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for PanicError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "panic in {}: {}\n\nRust backtrace:\n{}",
+            self.name, self.payload, self.backtrace
+        )
+    }
+}
+
+impl std::error::Error for PanicError {}
+
+fn guard_ffi<T: IntoFFIVal>(
+    name: &'static str,
+    f: impl FnOnce() -> T,
+) -> RResult<FFIValue, RBoxError> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f().into_ffi_val())) {
+        Ok(result) => result,
+        Err(payload) => RResult::RErr(RBoxError::new(PanicError::new(name, payload))),
+    }
+}
+
 impl PtyProcess {
     pub fn kill(&mut self) {
         self.child.kill().ok();
@@ -105,7 +153,7 @@ impl PtyProcess {
     // TODO: Replace this with a proper result rather than a bool
     pub fn send_command(&mut self, command: &str) -> bool {
         for byte in command.as_bytes() {
-            if let Err(_) = self.command_sender.send(*byte) {
+            if self.command_sender.send(*byte).is_err() {
                 return false;
             }
         }
@@ -132,7 +180,7 @@ impl PtyProcess {
     pub fn async_try_read_line(&mut self) -> FfiFuture<RResult<FFIValue, RBoxError>> {
         let ar = Arc::clone(&self.async_receiver);
 
-        async move {
+        std::panic::AssertUnwindSafe(async move {
             let mut guard = ar.lock().await;
 
             let mut buffer = String::new();
@@ -177,7 +225,20 @@ impl PtyProcess {
                     }
                 }
             }
-        }
+        })
+        .catch_unwind()
+        .map(|result| match result {
+            Ok(value) => value,
+            Err(payload) => RResult::ROk(FFIValue::Vector(
+                vec![
+                    FFIValue::StringV(RString::from("panic")),
+                    FFIValue::StringV(RString::from(
+                        PanicError::new("async-try-read-line", payload).to_string(),
+                    )),
+                ]
+                .into(),
+            )),
+        })
         .into_ffi()
     }
 }
@@ -196,281 +257,379 @@ fn create_module() -> FFIModule {
     let mut module = FFIModule::new("steel/pty-process");
 
     module
-        .register_fn("create-native-pty-system!", create_native_pty_system)
+        .register_fn("create-native-pty-system!", |command: String| {
+            guard_ffi("create-native-pty-system!", move || {
+                create_native_pty_system(command)
+            })
+        })
         .register_fn(
             "create-native-pty-system-with-cwd!",
-            create_native_pty_system_with_cwd,
+            |command: String, cwd: String| {
+                guard_ffi(
+                    "create-native-pty-system-with-cwd!",
+                    move || create_native_pty_system_with_cwd(command, cwd),
+                )
+            },
         )
         .register_fn(
             "create-native-pty-system-with-args-and-cwd!",
-            create_native_pty_system_with_args_and_cwd,
+            |command: String, args: Vec<String>, cwd: String| {
+                guard_ffi(
+                    "create-native-pty-system-with-args-and-cwd!",
+                    move || create_native_pty_system_with_args_and_cwd(command, args, cwd),
+                )
+            },
         )
-        .register_fn("kill-pty-process!", PtyProcess::kill)
-        .register_fn("pty-process-send-command", PtyProcess::send_command)
+        .register_fn("kill-pty-process!", |pty: &mut PtyProcess| {
+            guard_ffi("kill-pty-process!", move || PtyProcess::kill(pty))
+        })
+        .register_fn(
+            "pty-process-send-command",
+            |pty: &mut PtyProcess, command: &str| {
+                guard_ffi(
+                    "pty-process-send-command",
+                    move || PtyProcess::send_command(pty, command),
+                )
+            },
+        )
         .register_fn(
             "pty-process-send-command-char",
-            PtyProcess::send_command_char,
+            |pty: &mut PtyProcess, command: char| {
+                guard_ffi(
+                    "pty-process-send-command-char",
+                    move || PtyProcess::send_command_char(pty, command),
+                )
+            },
         )
-        .register_fn("async-try-read-line", PtyProcess::async_try_read_line)
-        .register_fn("pty-resize!", PtyProcess::resize)
-        .register_fn("virtual-terminal", |pty: &mut PtyProcess| VirtualTerminal {
-            terminal: Terminal::new(
-                wezterm_term::TerminalSize::default(),
-                Arc::new(TermConfig::new()),
-                "bash",
-                "0.1.0",
-                Box::new(pty.writer.clone()),
-            ),
-            screen_iterator: ScreenCellIterator { x: 0, y: 0 },
-            last_cell: None,
-            last_reverse: false,
-            run_x: 0,
-            run_y: 0,
-            scroll_up_modifier: 0,
+        .register_fn("async-try-read-line", |pty: &mut PtyProcess| {
+            guard_ffi("async-try-read-line", move || {
+                PtyProcess::async_try_read_line(pty)
+            })
+        })
+        .register_fn(
+            "pty-resize!",
+            |pty: &mut PtyProcess, rows: usize, cols: usize| {
+                guard_ffi("pty-resize!", move || PtyProcess::resize(pty, rows, cols))
+            },
+        )
+        .register_fn("virtual-terminal", |pty: &mut PtyProcess| {
+            guard_ffi("virtual-terminal", move || VirtualTerminal {
+                terminal: Terminal::new(
+                    wezterm_term::TerminalSize::default(),
+                    Arc::new(TermConfig::new()),
+                    "bash",
+                    "0.1.0",
+                    Box::new(pty.writer.clone()),
+                ),
+                screen_iterator: ScreenCellIterator { x: 0, y: 0 },
+                last_cell: None,
+                last_reverse: false,
+                run_x: 0,
+                run_y: 0,
+                scroll_up_modifier: 0,
+            })
         })
         // Raw virtual terminal!
-        .register_fn("raw-virtual-terminal", || VirtualTerminal {
-            terminal: Terminal::new(
-                wezterm_term::TerminalSize::default(),
-                Arc::new(TermConfig::new()),
-                "bash",
-                "0.1.0",
-                Box::new(std::io::empty()),
-            ),
-            screen_iterator: ScreenCellIterator { x: 0, y: 0 },
-            last_cell: None,
-            last_reverse: false,
-            run_x: 0,
-            run_y: 0,
-            scroll_up_modifier: 0,
+        .register_fn("raw-virtual-terminal", || {
+            guard_ffi("raw-virtual-terminal", move || VirtualTerminal {
+                terminal: Terminal::new(
+                    wezterm_term::TerminalSize::default(),
+                    Arc::new(TermConfig::new()),
+                    "bash",
+                    "0.1.0",
+                    Box::new(std::io::empty()),
+                ),
+                screen_iterator: ScreenCellIterator { x: 0, y: 0 },
+                last_cell: None,
+                last_reverse: false,
+                run_x: 0,
+                run_y: 0,
+                scroll_up_modifier: 0,
+            })
         })
-        .register_fn("vte/advance-bytes", VirtualTerminal::advance_bytes)
+        .register_fn("vte/advance-bytes", |term: &mut VirtualTerminal, bytes: &str| {
+            guard_ffi("vte/advance-bytes", move || {
+                VirtualTerminal::advance_bytes(term, bytes)
+            })
+        })
         // Advancing with immediate action
         .register_fn(
             "vte/advance-bytes-char",
-            VirtualTerminal::advance_bytes_char,
+            |term: &mut VirtualTerminal, bytes: char| {
+                guard_ffi("vte/advance-bytes-char", move || {
+                    VirtualTerminal::advance_bytes_char(term, bytes)
+                })
+            },
         )
         .register_fn(
             "vte/advance-bytes-with-carriage-return",
-            VirtualTerminal::advance_bytes_with_carriage_return,
+            |term: &mut VirtualTerminal, bytes: &str| {
+                guard_ffi("vte/advance-bytes-with-carriage-return", move || {
+                    VirtualTerminal::advance_bytes_with_carriage_return(term, bytes)
+                })
+            },
         )
-        .register_fn("vte/resize", VirtualTerminal::resize)
-        .register_fn("vte/lines", VirtualTerminal::lines)
-        .register_fn("vte/line->string", TermLine::as_str)
-        .register_fn("vte/cursor", VirtualTerminal::cursor)
-        .register_fn("vte/cursor-visible?", VirtualTerminal::cursor_visible)
-        .register_fn("vte/cursor-x", VirtualTerminal::cursor_x)
-        .register_fn("vte/cursor-y", VirtualTerminal::cursor_y)
-        .register_fn("vte/line->cells", |line: &mut TermLine| -> Vec<FFIValue> {
-            line.line
-                .cells_mut()
-                .iter()
-                .cloned()
-                .map(|cell| TermCell { cell }.into_ffi_val().unwrap())
-                .collect()
+        .register_fn(
+            "vte/resize",
+            |term: &mut VirtualTerminal, rows: usize, cols: usize| {
+                guard_ffi("vte/resize", move || {
+                    VirtualTerminal::resize(term, rows, cols)
+                })
+            },
+        )
+        .register_fn("vte/lines", |term: &mut VirtualTerminal| {
+            guard_ffi("vte/lines", move || VirtualTerminal::lines(term))
+        })
+        .register_fn("vte/line->string", |line: &TermLine| {
+            guard_ffi("vte/line->string", move || TermLine::as_str(line))
+        })
+        .register_fn("vte/cursor", |term: &VirtualTerminal| {
+            guard_ffi("vte/cursor", move || VirtualTerminal::cursor(term))
+        })
+        .register_fn("vte/cursor-visible?", |term: &VirtualTerminal| {
+            guard_ffi("vte/cursor-visible?", move || {
+                VirtualTerminal::cursor_visible(term)
+            })
+        })
+        .register_fn("vte/cursor-x", |term: &VirtualTerminal| {
+            guard_ffi("vte/cursor-x", move || VirtualTerminal::cursor_x(term))
+        })
+        .register_fn("vte/cursor-y", |term: &VirtualTerminal| {
+            guard_ffi("vte/cursor-y", move || VirtualTerminal::cursor_y(term))
+        })
+        .register_fn("vte/line->cells", |line: &mut TermLine| {
+            guard_ffi("vte/line->cells", move || {
+                line.line
+                    .cells_mut()
+                    .iter()
+                    .cloned()
+                    .map(|cell| TermCell { cell }.into_ffi_val().unwrap())
+                    .collect::<Vec<FFIValue>>()
+            })
         })
         .register_fn("vte/cell->fg", |cell: &TermCell| {
-            TermColorAttribute(cell.cell.attrs().foreground())
+            guard_ffi("vte/cell->fg", move || {
+                TermColorAttribute(cell.cell.attrs().foreground())
+            })
         })
         .register_fn("vte/cell->bg", |cell: &TermCell| {
-            TermColorAttribute(cell.cell.attrs().background())
+            guard_ffi("vte/cell->bg", move || {
+                TermColorAttribute(cell.cell.attrs().background())
+            })
         })
         // Get the color attribute, map it to the one that helix uses
         // TODO: Re-use the memory - we should pass in an FFI Vector, and then just reuse it over and over.
         .register_fn(
             "term/color-attribute",
-            |attribute: &TermColorAttribute| match attribute.0 {
-                ColorAttribute::TrueColorWithPaletteFallback(SrgbaTuple(r, g, b, a), _) => vec![
-                    ((r * 255.0).round() as isize).into_ffi_val().unwrap(),
-                    ((g * 255.0).round() as isize).into_ffi_val().unwrap(),
-                    ((b * 255.0).round() as isize).into_ffi_val().unwrap(),
-                    ((a * 255.0).round() as isize).into_ffi_val().unwrap(),
-                ]
-                .into_ffi_val(),
-                ColorAttribute::TrueColorWithDefaultFallback(SrgbaTuple(r, g, b, a)) => vec![
-                    ((r * 255.0).round() as isize).into_ffi_val().unwrap(),
-                    ((g * 255.0).round() as isize).into_ffi_val().unwrap(),
-                    ((b * 255.0).round() as isize).into_ffi_val().unwrap(),
-                    ((a * 255.0).round() as isize).into_ffi_val().unwrap(),
-                ]
-                .into_ffi_val(),
-                ColorAttribute::PaletteIndex(index) => (index as usize).into_ffi_val(),
-                ColorAttribute::Default => false.into_ffi_val(),
+            |attribute: &TermColorAttribute| {
+                guard_ffi("term/color-attribute", move || match attribute.0 {
+                    ColorAttribute::TrueColorWithPaletteFallback(SrgbaTuple(r, g, b, a), _) => vec![
+                        ((r * 255.0).round() as isize).into_ffi_val().unwrap(),
+                        ((g * 255.0).round() as isize).into_ffi_val().unwrap(),
+                        ((b * 255.0).round() as isize).into_ffi_val().unwrap(),
+                        ((a * 255.0).round() as isize).into_ffi_val().unwrap(),
+                    ]
+                    .into_ffi_val(),
+                    ColorAttribute::TrueColorWithDefaultFallback(SrgbaTuple(r, g, b, a)) => vec![
+                        ((r * 255.0).round() as isize).into_ffi_val().unwrap(),
+                        ((g * 255.0).round() as isize).into_ffi_val().unwrap(),
+                        ((b * 255.0).round() as isize).into_ffi_val().unwrap(),
+                        ((a * 255.0).round() as isize).into_ffi_val().unwrap(),
+                    ]
+                    .into_ffi_val(),
+                    ColorAttribute::PaletteIndex(index) => (index as usize).into_ffi_val(),
+                    ColorAttribute::Default => false.into_ffi_val(),
+                })
             },
         )
         .register_fn(
             "term/color-attribute-set!",
             |attribute: &TermColorAttribute, shared_vec: FFIArg| {
-                if let FFIArg::VectorRef(VectorRef { mut vec, .. }) = shared_vec {
-                    match attribute.0 {
-                        ColorAttribute::TrueColorWithPaletteFallback(SrgbaTuple(r, g, b, a), _) => {
-                            // Update in place.
-                            vec[0] = FFIValue::IntV((r * 255.0).round() as isize);
-                            vec[1] = FFIValue::IntV((g * 255.0).round() as isize);
-                            vec[2] = FFIValue::IntV((b * 255.0).round() as isize);
-                            vec[3] = FFIValue::IntV((a * 255.0).round() as isize);
+                guard_ffi("term/color-attribute-set!", move || {
+                    if let FFIArg::VectorRef(VectorRef { mut vec, .. }) = shared_vec {
+                        match attribute.0 {
+                            ColorAttribute::TrueColorWithPaletteFallback(SrgbaTuple(r, g, b, a), _) => {
+                                // Update in place.
+                                vec[0] = FFIValue::IntV((r * 255.0).round() as isize);
+                                vec[1] = FFIValue::IntV((g * 255.0).round() as isize);
+                                vec[2] = FFIValue::IntV((b * 255.0).round() as isize);
+                                vec[3] = FFIValue::IntV((a * 255.0).round() as isize);
 
-                            true.into_ffi_val()
-                        }
-                        ColorAttribute::TrueColorWithDefaultFallback(SrgbaTuple(r, g, b, a)) => {
-                            vec[0] = FFIValue::IntV((r * 255.0).round() as isize);
-                            vec[1] = FFIValue::IntV((g * 255.0).round() as isize);
-                            vec[2] = FFIValue::IntV((b * 255.0).round() as isize);
-                            vec[3] = FFIValue::IntV((a * 255.0).round() as isize);
+                                true.into_ffi_val()
+                            }
+                            ColorAttribute::TrueColorWithDefaultFallback(SrgbaTuple(r, g, b, a)) => {
+                                vec[0] = FFIValue::IntV((r * 255.0).round() as isize);
+                                vec[1] = FFIValue::IntV((g * 255.0).round() as isize);
+                                vec[2] = FFIValue::IntV((b * 255.0).round() as isize);
+                                vec[3] = FFIValue::IntV((a * 255.0).round() as isize);
 
-                            true.into_ffi_val()
+                                true.into_ffi_val()
+                            }
+                            ColorAttribute::PaletteIndex(index) => (index as usize).into_ffi_val(),
+                            ColorAttribute::Default => false.into_ffi_val(),
                         }
-                        ColorAttribute::PaletteIndex(index) => (index as usize).into_ffi_val(),
-                        ColorAttribute::Default => false.into_ffi_val(),
+                    } else {
+                        false.into_ffi_val()
                     }
-                } else {
-                    false.into_ffi_val()
-                }
+                })
             },
         )
-        .register_fn("vte/cell-width", |cell: &TermCell| cell.cell.width())
+        .register_fn("vte/cell-width", |cell: &TermCell| {
+            guard_ffi("vte/cell-width", move || cell.cell.width())
+        })
         .register_fn("vte/cell-string", |cell: &TermCell| {
-            cell.cell.str().to_string()
+            guard_ffi("vte/cell-string", move || cell.cell.str().to_string())
         })
         .register_fn("vte/reset-iterator!", |term: &mut VirtualTerminal| {
-            term.screen_iterator.x = 0;
-            term.screen_iterator.y = term.scroll_up_modifier;
-            term.last_cell = None;
+            guard_ffi("vte/reset-iterator!", move || {
+                term.screen_iterator.x = 0;
+                term.screen_iterator.y = term.scroll_up_modifier;
+                term.last_cell = None;
+            })
         })
         // This should move forward until we actually have something meaningful,
         // rather than arbitrarily stepping forward one step.
         .register_fn("vte/advance-iterator!", |term: &mut VirtualTerminal| {
-            let size = term.terminal.get_size();
+            guard_ffi("vte/advance-iterator!", move || {
+                let size = term.terminal.get_size();
 
-            let (rows, cols) = (size.rows as i64 + term.scroll_up_modifier, size.cols);
+                let (rows, cols) = (size.rows as i64 + term.scroll_up_modifier, size.cols);
 
-            if term.screen_iterator.x < cols && term.screen_iterator.y < rows {
-                term.last_cell = term
-                    .terminal
-                    .screen_mut()
-                    .get_cell_scrollback(term.screen_iterator.x, term.screen_iterator.y as _)
-                    .cloned();
+                if term.screen_iterator.x < cols && term.screen_iterator.y < rows {
+                    term.last_cell = term
+                        .terminal
+                        .screen_mut()
+                        .get_cell_scrollback(term.screen_iterator.x, term.screen_iterator.y as _)
+                        .cloned();
 
-                term.screen_iterator.x += 1;
-                return true;
-            }
+                    term.screen_iterator.x += 1;
+                    return true;
+                }
 
-            if term.screen_iterator.x >= cols && term.screen_iterator.y < rows {
-                term.last_cell = term
-                    .terminal
-                    .screen_mut()
-                    .get_cell_scrollback(term.screen_iterator.x, term.screen_iterator.y as _)
-                    .cloned();
+                if term.screen_iterator.x >= cols && term.screen_iterator.y < rows {
+                    term.last_cell = term
+                        .terminal
+                        .screen_mut()
+                        .get_cell_scrollback(term.screen_iterator.x, term.screen_iterator.y as _)
+                        .cloned();
 
-                term.screen_iterator.x = 0;
-                term.screen_iterator.y += 1;
+                    term.screen_iterator.x = 0;
+                    term.screen_iterator.y += 1;
 
-                return true;
-            }
+                    return true;
+                }
 
-            false
+                false
+            })
         })
         // Advance until there is a string?
         .register_fn(
             "vte/advance-iterator-until-string!",
             |term: &mut VirtualTerminal| {
-                let size = term.terminal.get_size();
+                guard_ffi("vte/advance-iterator-until-string!", move || {
+                    let size = term.terminal.get_size();
 
-                let (rows, cols) = (size.rows as i64 + term.scroll_up_modifier, size.cols);
+                    let (rows, cols) = (size.rows as i64 + term.scroll_up_modifier, size.cols);
 
-                loop {
-                    if term.screen_iterator.x < cols && term.screen_iterator.y < rows {
-                        let last_cell = term.terminal.screen_mut().get_cell_scrollback(
-                            term.screen_iterator.x,
-                            term.screen_iterator.y as _,
-                        );
+                    loop {
+                        if term.screen_iterator.x < cols && term.screen_iterator.y < rows {
+                            let last_cell = term.terminal.screen_mut().get_cell_scrollback(
+                                term.screen_iterator.x,
+                                term.screen_iterator.y as _,
+                            );
 
-                        term.screen_iterator.x += 1;
+                            term.screen_iterator.x += 1;
 
-                        if last_cell.is_some() {
-                            term.last_cell = last_cell.cloned();
-                            return true;
+                            if last_cell.is_some() {
+                                term.last_cell = last_cell.cloned();
+                                return true;
+                            } else {
+                                continue;
+                            }
+                        }
+
+                        if term.screen_iterator.x >= cols && term.screen_iterator.y < rows {
+                            let last_cell = term.terminal.screen_mut().get_cell_scrollback(
+                                term.screen_iterator.x,
+                                term.screen_iterator.y as _,
+                            );
+
+                            term.screen_iterator.x = 0;
+                            term.screen_iterator.y += 1;
+
+                            if last_cell.is_some() {
+                                term.last_cell = last_cell.cloned();
+                                return true;
+                            } else {
+                                continue;
+                            }
                         } else {
-                            continue;
+                            return false;
                         }
                     }
-
-                    if term.screen_iterator.x >= cols && term.screen_iterator.y < rows {
-                        let last_cell = term.terminal.screen_mut().get_cell_scrollback(
-                            term.screen_iterator.x,
-                            term.screen_iterator.y as _,
-                        );
-
-                        term.screen_iterator.x = 0;
-                        term.screen_iterator.y += 1;
-
-                        if last_cell.is_some() {
-                            term.last_cell = last_cell.cloned();
-                            return true;
-                        } else {
-                            continue;
-                        }
-                    } else {
-                        return false;
-                    }
-                }
+                })
             },
         )
         .register_fn(
             "vte/advance-iterator-and-update-cells!",
             |term: &mut VirtualTerminal, mut_str: RMut<'_, RString>, bg: FFIArg, fg: FFIArg| {
-                let size = term.terminal.get_size();
+                guard_ffi(
+                    "vte/advance-iterator-and-update-cells!",
+                    move || {
+                        let size = term.terminal.get_size();
 
-                let (rows, cols) = (size.rows as i64 + term.scroll_up_modifier, size.cols);
+                        let (rows, cols) = (size.rows as i64 + term.scroll_up_modifier, size.cols);
 
-                loop {
-                    if term.screen_iterator.x < cols && term.screen_iterator.y < rows {
-                        let last_cell = term.terminal.screen_mut().get_cell_scrollback(
-                            term.screen_iterator.x,
-                            term.screen_iterator.y as _,
-                        );
+                        loop {
+                            if term.screen_iterator.x < cols && term.screen_iterator.y < rows {
+                                let last_cell = term.terminal.screen_mut().get_cell_scrollback(
+                                    term.screen_iterator.x,
+                                    term.screen_iterator.y as _,
+                                );
 
-                        term.screen_iterator.x += 1;
+                                term.screen_iterator.x += 1;
 
-                        if let Some(cell) = last_cell {
-                            // term.last_cell = last_cell.cloned();
-                            if is_invisible(cell) {
-                                continue;
+                                if let Some(cell) = last_cell {
+                                    // term.last_cell = last_cell.cloned();
+                                    if is_invisible(cell) {
+                                        continue;
+                                    }
+                                    term.last_reverse = cell.attrs().reverse();
+                                    update_cell(cell, mut_str, bg, fg);
+
+                                    return true;
+                                } else {
+                                    continue;
+                                }
                             }
-                            term.last_reverse = cell.attrs().reverse();
-                            update_cell(cell, mut_str, bg, fg);
 
-                            return true;
-                        } else {
-                            continue;
-                        }
-                    }
+                            if term.screen_iterator.x >= cols && term.screen_iterator.y < rows {
+                                let last_cell = term.terminal.screen_mut().get_cell_scrollback(
+                                    term.screen_iterator.x,
+                                    term.screen_iterator.y as _,
+                                );
 
-                    if term.screen_iterator.x >= cols && term.screen_iterator.y < rows {
-                        let last_cell = term.terminal.screen_mut().get_cell_scrollback(
-                            term.screen_iterator.x,
-                            term.screen_iterator.y as _,
-                        );
+                                term.screen_iterator.x = 0;
+                                term.screen_iterator.y += 1;
 
-                        term.screen_iterator.x = 0;
-                        term.screen_iterator.y += 1;
+                                if let Some(cell) = last_cell {
+                                    // term.last_cell = last_cell.cloned();
+                                    if is_invisible(cell) {
+                                        continue;
+                                    }
+                                    term.last_reverse = cell.attrs().reverse();
+                                    update_cell(cell, mut_str, bg, fg);
 
-                        if let Some(cell) = last_cell {
-                            // term.last_cell = last_cell.cloned();
-                            if is_invisible(cell) {
-                                continue;
+                                    return true;
+                                } else {
+                                    continue;
+                                }
+                            } else {
+                                return false;
                             }
-                            term.last_reverse = cell.attrs().reverse();
-                            update_cell(cell, mut_str, bg, fg);
-
-                            return true;
-                        } else {
-                            continue;
                         }
-                    } else {
-                        return false;
-                    }
-                }
+                    },
+                )
             },
         )
         // Batched sibling of vte/advance-iterator-and-update-cells!: instead of one
@@ -484,246 +643,280 @@ fn create_module() -> FFIModule {
         .register_fn(
             "vte/advance-run!",
             |term: &mut VirtualTerminal, mut mut_str: RMut<'_, RString>, bg: FFIArg, fg: FFIArg| {
-                let size = term.terminal.get_size();
-                let (rows, cols) = (size.rows as i64 + term.scroll_up_modifier, size.cols);
+                guard_ffi("vte/advance-run!", move || {
+                    let size = term.terminal.get_size();
+                    let (rows, cols) = (size.rows as i64 + term.scroll_up_modifier, size.cols);
 
-                // Find the next visible cell, same walk as the per-cell variant.
-                let first = loop {
-                    if term.screen_iterator.y >= rows {
-                        return false;
-                    }
-                    if term.screen_iterator.x >= cols {
-                        term.screen_iterator.x = 0;
-                        term.screen_iterator.y += 1;
-                        continue;
-                    }
-                    let cell = term.terminal.screen_mut().get_cell_scrollback(
-                        term.screen_iterator.x,
-                        term.screen_iterator.y as _,
-                    );
-                    term.screen_iterator.x += 1;
-                    match cell {
-                        Some(cell) if !is_invisible(cell) => break cell.clone(),
-                        _ => continue,
-                    }
-                };
-
-                term.run_x = term.screen_iterator.x - 1;
-                term.run_y = term.screen_iterator.y - term.scroll_up_modifier;
-
-                let attrs = first.attrs().to_owned();
-                term.last_reverse = attrs.reverse();
-
-                let mut_str = mut_str.get_mut();
-                mut_str.clear();
-                mut_str.push_str(first.str());
-
-                // Extend while cells stay visible and share (fg, bg, reverse).
-                while term.screen_iterator.x < cols {
-                    let cell = term.terminal.screen_mut().get_cell_scrollback(
-                        term.screen_iterator.x,
-                        term.screen_iterator.y as _,
-                    );
-                    match cell {
-                        Some(cell)
-                            if !is_invisible(cell)
-                                && cell.attrs().foreground() == attrs.foreground()
-                                && cell.attrs().background() == attrs.background()
-                                && cell.attrs().reverse() == attrs.reverse() =>
-                        {
-                            mut_str.push_str(cell.str());
-                            term.screen_iterator.x += 1;
+                    // Find the next visible cell, same walk as the per-cell variant.
+                    let first = loop {
+                        if term.screen_iterator.y >= rows {
+                            return false;
                         }
-                        _ => break,
-                    }
-                }
+                        if term.screen_iterator.x >= cols {
+                            term.screen_iterator.x = 0;
+                            term.screen_iterator.y += 1;
+                            continue;
+                        }
+                        let cell = term.terminal.screen_mut().get_cell_scrollback(
+                            term.screen_iterator.x,
+                            term.screen_iterator.y as _,
+                        );
+                        term.screen_iterator.x += 1;
+                        match cell {
+                            Some(cell) if !is_invisible(cell) => break cell.clone(),
+                            _ => continue,
+                        }
+                    };
 
-                if let FFIArg::CustomRef(CustomRef { mut custom, .. }) = bg {
-                    if let Some(attr) = as_underlying_ffi_type::<TermColorAttribute>(custom.get_mut()) {
-                        attr.0 = attrs.background();
+                    term.run_x = term.screen_iterator.x - 1;
+                    term.run_y = term.screen_iterator.y - term.scroll_up_modifier;
+
+                    let attrs = first.attrs().to_owned();
+                    term.last_reverse = attrs.reverse();
+
+                    let mut_str = mut_str.get_mut();
+                    mut_str.clear();
+                    mut_str.push_str(first.str());
+
+                    // Extend while cells stay visible and share (fg, bg, reverse).
+                    while term.screen_iterator.x < cols {
+                        let cell = term.terminal.screen_mut().get_cell_scrollback(
+                            term.screen_iterator.x,
+                            term.screen_iterator.y as _,
+                        );
+                        match cell {
+                            Some(cell)
+                                if !is_invisible(cell)
+                                    && cell.attrs().foreground() == attrs.foreground()
+                                    && cell.attrs().background() == attrs.background()
+                                    && cell.attrs().reverse() == attrs.reverse() =>
+                            {
+                                mut_str.push_str(cell.str());
+                                term.screen_iterator.x += 1;
+                            }
+                            _ => break,
+                        }
                     }
-                }
-                if let FFIArg::CustomRef(CustomRef { mut custom, .. }) = fg {
-                    if let Some(attr) = as_underlying_ffi_type::<TermColorAttribute>(custom.get_mut()) {
-                        attr.0 = attrs.foreground();
-                    }
-                }
-                true
-            },
-        )
-        .register_fn("vte/iter-run-x", |term: &VirtualTerminal| {
-            term.run_x as isize
-        })
-        .register_fn("vte/iter-run-y", |term: &VirtualTerminal| {
-            term.run_y as isize
-        })
-        .register_fn("vte/iter-x", |term: &VirtualTerminal| {
-            term.screen_iterator.x
-        })
-        .register_fn("vte/iter-y", |term: &VirtualTerminal| {
-            (term.screen_iterator.y - term.scroll_up_modifier) as isize
-        })
-        // TODO: Add function to mutate in place
-        .register_fn("vte/iter-cell-fg", |term: &VirtualTerminal| {
-            if let Some(cell) = &term.last_cell {
-                TermColorAttribute(cell.attrs().to_owned().foreground()).into_ffi_val()
-            } else {
-                false.into_ffi_val()
-            }
-        })
-        // TODO: Add function to mutate in place
-        .register_fn("vte/iter-cell-bg", |term: &VirtualTerminal| {
-            if let Some(cell) = &term.last_cell {
-                TermColorAttribute(cell.attrs().to_owned().background()).into_ffi_val()
-            } else {
-                false.into_ffi_val()
-            }
-        })
-        .register_fn("vte/iter-cell-reverse?", |term: &VirtualTerminal| {
-            term.last_reverse
-        })
-        .register_fn("vte/empty-cell", || {
-            TermColorAttribute(ColorAttribute::default())
-        })
-        // Steel has no reader for an ffi MutableString, so a caller that wants
-        // the text of a painted run has to go through here.
-        .register_fn("mutable-string-to-string", |s: RMut<'_, RString>| {
-            s.get().as_str().to_string()
-        })
-        .register_fn(
-            "vte/iter-cell-bg-fg-set-attr!",
-            |term: &VirtualTerminal, bg: FFIArg, fg: FFIArg| {
-                if let Some(cell) = &term.last_cell {
+
                     if let FFIArg::CustomRef(CustomRef { mut custom, .. }) = bg {
                         if let Some(attr) =
                             as_underlying_ffi_type::<TermColorAttribute>(custom.get_mut())
                         {
-                            attr.0 = cell.attrs().background();
+                            attr.0 = attrs.background();
                         }
                     }
-
                     if let FFIArg::CustomRef(CustomRef { mut custom, .. }) = fg {
                         if let Some(attr) =
                             as_underlying_ffi_type::<TermColorAttribute>(custom.get_mut())
                         {
-                            attr.0 = cell.attrs().foreground();
+                            attr.0 = attrs.foreground();
+                        }
+                    }
+                    true
+                })
+            },
+        )
+        .register_fn("vte/iter-run-x", |term: &VirtualTerminal| {
+            guard_ffi("vte/iter-run-x", move || term.run_x as isize)
+        })
+        .register_fn("vte/iter-run-y", |term: &VirtualTerminal| {
+            guard_ffi("vte/iter-run-y", move || term.run_y as isize)
+        })
+        .register_fn("vte/iter-x", |term: &VirtualTerminal| {
+            guard_ffi("vte/iter-x", move || term.screen_iterator.x)
+        })
+        .register_fn("vte/iter-y", |term: &VirtualTerminal| {
+            guard_ffi("vte/iter-y", move || {
+                (term.screen_iterator.y - term.scroll_up_modifier) as isize
+            })
+        })
+        // TODO: Add function to mutate in place
+        .register_fn("vte/iter-cell-fg", |term: &VirtualTerminal| {
+            guard_ffi("vte/iter-cell-fg", move || {
+                if let Some(cell) = &term.last_cell {
+                    TermColorAttribute(cell.attrs().to_owned().foreground()).into_ffi_val()
+                } else {
+                    false.into_ffi_val()
+                }
+            })
+        })
+        // TODO: Add function to mutate in place
+        .register_fn("vte/iter-cell-bg", |term: &VirtualTerminal| {
+            guard_ffi("vte/iter-cell-bg", move || {
+                if let Some(cell) = &term.last_cell {
+                    TermColorAttribute(cell.attrs().to_owned().background()).into_ffi_val()
+                } else {
+                    false.into_ffi_val()
+                }
+            })
+        })
+        .register_fn("vte/iter-cell-reverse?", |term: &VirtualTerminal| {
+            guard_ffi("vte/iter-cell-reverse?", move || term.last_reverse)
+        })
+        .register_fn("vte/empty-cell", || {
+            guard_ffi("vte/empty-cell", move || {
+                TermColorAttribute(ColorAttribute::default())
+            })
+        })
+        // Steel has no reader for an ffi MutableString, so a caller that wants
+        // the text of a painted run has to go through here.
+        .register_fn("mutable-string-to-string", |s: RMut<'_, RString>| {
+            guard_ffi("mutable-string-to-string", move || s.get().as_str().to_string())
+        })
+        .register_fn(
+            "vte/iter-cell-bg-fg-set-attr!",
+            |term: &VirtualTerminal, bg: FFIArg, fg: FFIArg| {
+                guard_ffi("vte/iter-cell-bg-fg-set-attr!", move || {
+                    if let Some(cell) = &term.last_cell {
+                        if let FFIArg::CustomRef(CustomRef { mut custom, .. }) = bg {
+                            if let Some(attr) =
+                                as_underlying_ffi_type::<TermColorAttribute>(custom.get_mut())
+                            {
+                                attr.0 = cell.attrs().background();
+                            }
+                        }
 
-                            return true.into_ffi_val();
+                        if let FFIArg::CustomRef(CustomRef { mut custom, .. }) = fg {
+                            if let Some(attr) =
+                                as_underlying_ffi_type::<TermColorAttribute>(custom.get_mut())
+                            {
+                                attr.0 = cell.attrs().foreground();
+
+                                return true.into_ffi_val();
+                            } else {
+                                return false.into_ffi_val();
+                            }
                         } else {
                             return false.into_ffi_val();
                         }
-                    } else {
-                        return false.into_ffi_val();
                     }
-                }
 
-                true.into_ffi_val()
+                    true.into_ffi_val()
+                })
             },
         )
         .register_fn(
             "vte/iter-cell-bg-set-attr!",
             |term: &VirtualTerminal, val: FFIArg| {
-                if let Some(cell) = &term.last_cell {
-                    if let FFIArg::CustomRef(CustomRef { mut custom, .. }) = val {
-                        if let Some(attr) =
-                            as_underlying_ffi_type::<TermColorAttribute>(custom.get_mut())
-                        {
-                            attr.0 = cell.attrs().to_owned().background();
+                guard_ffi("vte/iter-cell-bg-set-attr!", move || {
+                    if let Some(cell) = &term.last_cell {
+                        if let FFIArg::CustomRef(CustomRef { mut custom, .. }) = val {
+                            if let Some(attr) =
+                                as_underlying_ffi_type::<TermColorAttribute>(custom.get_mut())
+                            {
+                                attr.0 = cell.attrs().to_owned().background();
 
-                            return true.into_ffi_val();
+                                true.into_ffi_val()
+                            } else {
+                                false.into_ffi_val()
+                            }
                         } else {
-                            return false.into_ffi_val();
+                            false.into_ffi_val()
                         }
                     } else {
-                        return false.into_ffi_val();
+                        false.into_ffi_val()
                     }
-                } else {
-                    false.into_ffi_val()
-                }
+                })
             },
         )
         .register_fn(
             "vte/iter-cell-fg-set-attr!",
             |term: &VirtualTerminal, val: FFIArg| {
-                if let Some(cell) = &term.last_cell {
-                    if let FFIArg::CustomRef(CustomRef { mut custom, .. }) = val {
-                        if let Some(attr) =
-                            as_underlying_ffi_type::<TermColorAttribute>(custom.get_mut())
-                        {
-                            attr.0 = cell.attrs().to_owned().foreground();
+                guard_ffi("vte/iter-cell-fg-set-attr!", move || {
+                    if let Some(cell) = &term.last_cell {
+                        if let FFIArg::CustomRef(CustomRef { mut custom, .. }) = val {
+                            if let Some(attr) =
+                                as_underlying_ffi_type::<TermColorAttribute>(custom.get_mut())
+                            {
+                                attr.0 = cell.attrs().to_owned().foreground();
 
-                            return true.into_ffi_val();
+                                true.into_ffi_val()
+                            } else {
+                                false.into_ffi_val()
+                            }
                         } else {
-                            return false.into_ffi_val();
+                            false.into_ffi_val()
                         }
                     } else {
-                        return false.into_ffi_val();
+                        false.into_ffi_val()
                     }
-                } else {
-                    false.into_ffi_val()
-                }
+                })
             },
         )
         .register_fn("vte/iter-cell-str", |term: &VirtualTerminal| {
-            if let Some(cell) = &term.last_cell {
-                cell.str().to_string().into_ffi_val()
-            } else {
-                false.into_ffi_val()
-            }
+            guard_ffi("vte/iter-cell-str", move || {
+                if let Some(cell) = &term.last_cell {
+                    cell.str().to_string().into_ffi_val()
+                } else {
+                    false.into_ffi_val()
+                }
+            })
         })
         .register_fn(
             "vte/iter-cell-str-set-str!",
             |term: &VirtualTerminal, mut mut_str: RMut<'_, RString>| {
-                if let Some(cell) = &term.last_cell {
-                    mut_str.get_mut().clear();
-                    mut_str.get_mut().push_str(cell.str());
+                guard_ffi("vte/iter-cell-str-set-str!", move || {
+                    if let Some(cell) = &term.last_cell {
+                        mut_str.get_mut().clear();
+                        mut_str.get_mut().push_str(cell.str());
 
-                    RResult::ROk(FFIValue::Void)
-                } else {
-                    false.into_ffi_val()
-                }
+                        RResult::ROk(FFIValue::Void)
+                    } else {
+                        false.into_ffi_val()
+                    }
+                })
             },
         )
         // Batch all of the updates, less round trips across the FFI barrier
         .register_fn(
             "vte/iter-cell-bg-fg-set-attr-str!",
             |term: &VirtualTerminal, mut mut_str: RMut<'_, RString>, bg: FFIArg, fg: FFIArg| {
-                if let Some(cell) = &term.last_cell {
-                    mut_str.get_mut().clear();
-                    mut_str.get_mut().push_str(cell.str());
+                guard_ffi("vte/iter-cell-bg-fg-set-attr-str!", move || {
+                    if let Some(cell) = &term.last_cell {
+                        mut_str.get_mut().clear();
+                        mut_str.get_mut().push_str(cell.str());
 
-                    if let FFIArg::CustomRef(CustomRef { mut custom, .. }) = bg {
-                        if let Some(attr) =
-                            as_underlying_ffi_type::<TermColorAttribute>(custom.get_mut())
-                        {
-                            attr.0 = cell.attrs().background();
+                        if let FFIArg::CustomRef(CustomRef { mut custom, .. }) = bg {
+                            if let Some(attr) =
+                                as_underlying_ffi_type::<TermColorAttribute>(custom.get_mut())
+                            {
+                                attr.0 = cell.attrs().background();
+                            }
                         }
-                    }
 
-                    if let FFIArg::CustomRef(CustomRef { mut custom, .. }) = fg {
-                        if let Some(attr) =
-                            as_underlying_ffi_type::<TermColorAttribute>(custom.get_mut())
-                        {
-                            attr.0 = cell.attrs().foreground();
+                        if let FFIArg::CustomRef(CustomRef { mut custom, .. }) = fg {
+                            if let Some(attr) =
+                                as_underlying_ffi_type::<TermColorAttribute>(custom.get_mut())
+                            {
+                                attr.0 = cell.attrs().foreground();
 
-                            return true.into_ffi_val();
+                                return true.into_ffi_val();
+                            } else {
+                                return false.into_ffi_val();
+                            }
                         } else {
                             return false.into_ffi_val();
                         }
-                    } else {
-                        return false.into_ffi_val();
                     }
-                }
 
-                true.into_ffi_val()
+                    true.into_ffi_val()
+                })
             },
         )
         .register_fn("vte/scroll-up", |term: &mut VirtualTerminal| {
-            term.scroll_up_modifier = (term.scroll_up_modifier - 1)
-                .max(0 - term.terminal.screen().scrollback_rows() as i64);
+            guard_ffi("vte/scroll-up", move || {
+                term.scroll_up_modifier = (term.scroll_up_modifier - 1)
+                    .max(0 - term.terminal.screen().scrollback_rows() as i64);
+            })
         })
         .register_fn("vte/scroll-down", |term: &mut VirtualTerminal| {
-            term.scroll_up_modifier = (term.scroll_up_modifier + 1).min(0);
+            guard_ffi("vte/scroll-down", move || {
+                term.scroll_up_modifier = (term.scroll_up_modifier + 1).min(0);
+            })
+        })
+        // Test hook: always fails with a catchable Scheme error.
+        .register_fn("debug-panic!", |message: &str| {
+            guard_ffi("debug-panic!", move || -> FFIValue { panic!("{}", message) })
         });
 
     module
@@ -850,7 +1043,7 @@ fn spawn_in_pty(mut cmd: CommandBuilder) -> PtyProcess {
                     if valid > 0 {
                         let s = String::from_utf8_lossy(&carry[..valid]).into_owned();
                         carry.drain(..valid);
-                        if async_sender.send(s.into()).is_err() {
+                        if async_sender.send(s).is_err() {
                             break;
                         }
                     }
@@ -898,7 +1091,7 @@ fn spawn_in_pty(mut cmd: CommandBuilder) -> PtyProcess {
         // if !to_write.is_empty() {
         // To avoid deadlock, wrt. reading and waiting, we send
         // data to the stdin of the child in a different thread.
-        std::thread::spawn(move || loop {
+        std::thread::spawn(move || {
             while let Ok(command) = command_receiver.recv() {
                 // Writing to the master fails (EIO) once no slave endpoint is
                 // open anywhere, i.e. after the child exits: treat it as the
@@ -908,8 +1101,6 @@ fn spawn_in_pty(mut cmd: CommandBuilder) -> PtyProcess {
                     break;
                 }
             }
-
-            break;
         });
         // }
     }
@@ -973,7 +1164,7 @@ impl VirtualTerminal {
     }
 
     fn advance_bytes_char(&mut self, bytes: char) {
-        self.terminal.advance_bytes(&[bytes as u8])
+        self.terminal.advance_bytes([bytes as u8])
     }
 
     fn advance_bytes_with_carriage_return(&mut self, bytes: &str) {
@@ -981,7 +1172,7 @@ impl VirtualTerminal {
 
         for char in bytes.chars() {
             match char {
-                '\n' => self.terminal.advance_bytes(['\n' as u8, '\r' as u8]),
+                '\n' => self.terminal.advance_bytes([b'\n', b'\r']),
                 c => self.terminal.advance_bytes(c.encode_utf8(&mut buf)),
             }
         }

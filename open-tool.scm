@@ -215,6 +215,23 @@
               [else
                 (loop (cdr rest) (string-append acc (string (car rest))))]))))]))
 
+;; ------------------------------------------------------------------ failures
+;;
+;; The dylib catches its own panics and hands them back as FFI errors, so they
+;; reach Scheme as errors. A panic unwinding across the FFI boundary would abort
+;; helix, so the dylib must never let one escape.
+
+;; Close the tool first: that kills the child and restores the statusline word.
+;; Then re-raise, so helix reports the error in its engine popup, with the
+;; panic message and the Rust backtrace.
+(define (%tool-fail! err)
+  (split-overlay-close! "open-tool")
+  (error! "open-tool: the rust dylib failed" err))
+
+;; Run a thunk under the handler above.
+(define (%guard thunk)
+  (call-with-exception-handler %tool-fail! (lambda () (thunk))))
+
 ;; ------------------------------------------------------------------ pump
 
 ;; Reads the PTY asynchronously and feeds the emulator. The dylib returns
@@ -226,13 +243,20 @@
 (define (%pump state)
   (helix-await-callback (async-try-read-line (Tool-pty state))
     (lambda (line)
-      (cond
-        [(not line)
-          (set-box! (Tool-kill-switch state) #t)
-          (split-overlay-close! "open-tool")]
-        [else
-          (vte/advance-bytes (Tool-vte state) line)
-          (%pump state)]))))
+      (%guard
+        (lambda ()
+          (cond
+            ;; the dylib delivers a caught panic as a vector: a marker plus the
+            ;; message. an error result would skip this callback, and the tool
+            ;; would never close.
+            [(vector? line)
+              (error! "open-tool: the rust dylib panicked" (vector-ref line 1))]
+            [(not line)
+              (set-box! (Tool-kill-switch state) #t)
+              (split-overlay-close! "open-tool")]
+            [else
+              (vte/advance-bytes (Tool-vte state) line)
+              (%pump state)]))))))
 
 ;; ------------------------------------------------------------------ cursor
 ;;
@@ -262,9 +286,14 @@
       (vte/resize (Tool-vte state) h w)
       (pty-resize! (Tool-pty state) h w))))
 
+;; Paint entry point: %render-paint! does the work, this wrapper turns a dylib
+;; error into a closed tool plus a reported error.
+(define (%render! state rect buffer)
+  (%guard (lambda () (%render-paint! state rect buffer))))
+
 ;; Paint by style-run (cells sharing fg/bg/reverse): one frame-set-string! per
 ;; run keeps a full repaint cheap. The run start is the cell's own column.
-(define (%render! state rect buffer)
+(define (%render-paint! state rect buffer)
   (let* ([region (split-overlay-region (Tool-name state) rect)]
          [x0 (area-x region)]
          [y0 (area-y region)]
@@ -352,6 +381,11 @@
             ;; the event is consumed without a rerender
             event-result/consume-without-rerender))])))
 
+;; Event entry point: %handle-event-raw! does the work, this wrapper turns a
+;; dylib error into a closed tool plus a reported error.
+(define (%handle-event! state event)
+  (%guard (lambda () (%handle-event-raw! state event))))
+
 ;; Keys go to the program ONLY while the tool has focus: the release chord gives
 ;; them back to helix (scroll, select, copy, command mode, the `:` prompt) while
 ;; the overlay stays rendered and the child keeps running.
@@ -360,7 +394,7 @@
 ;;
 ;; NOTE: alt loses its modifier on non-char keys (key-event-up? and friends match
 ;; the key code only, components.rs:714).
-(define (%handle-event! state event)
+(define (%handle-event-raw! state event)
   (cond
     [(unbox (Tool-kill-switch state))
       (split-overlay-close! "open-tool")
@@ -464,6 +498,9 @@
 ;; F-keys and Home/End reach the program. A key that cannot be forwarded,
 ;; such as a lock key or print screen, is reported in the status line.
 ;; The tool stays open.
+;;
+;; A Rust panic inside the dylib closes the tool and is reported in helix's
+;; engine popup, with the panic message and the Rust backtrace.
 ;;
 ;; #### Arguments
 ;; - `program` (`string?`) - executable name or path. If it contains `/`, treated
