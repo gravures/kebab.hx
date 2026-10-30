@@ -401,18 +401,39 @@
           [(key-event-escape? event) (send "\x1b;")]
           [(key-event-enter? event) (send "\r")]
           [(key-event-tab? event) (send "\t")]
+          [(key-event-null? event) (send "\x00;")]
 
+          ;; A terminal sends these bytes for these keys.
+          ;; F1-F4 use the SS3 form (\x1b;OP..\x1b;OS); F5-F12 use CSI.
           ;; Steel hex escapes are terminated by ';' (\x1b;
           [(key-event-up? event) (send "\x1b;[A")]
           [(key-event-down? event) (send "\x1b;[B")]
           [(key-event-right? event) (send "\x1b;[C")]
           [(key-event-left? event) (send "\x1b;[D")]
+          [(key-event-home? event) (send "\x1b;[H")]
+          [(key-event-end? event) (send "\x1b;[F")]
+          [(key-event-insert? event) (send "\x1b;[2~")]
+          [(key-event-delete? event) (send "\x1b;[3~")]
+          [(key-event-page-up? event) (send "\x1b;[5~")]
+          [(key-event-page-down? event) (send "\x1b;[6~")]
+          [(key-event-F? event 1) (send "\x1b;OP")]
+          [(key-event-F? event 2) (send "\x1b;OQ")]
+          [(key-event-F? event 3) (send "\x1b;OR")]
+          [(key-event-F? event 4) (send "\x1b;OS")]
+          [(key-event-F? event 5) (send "\x1b;[15~")]
+          [(key-event-F? event 6) (send "\x1b;[17~")]
+          [(key-event-F? event 7) (send "\x1b;[18~")]
+          [(key-event-F? event 8) (send "\x1b;[19~")]
+          [(key-event-F? event 9) (send "\x1b;[20~")]
+          [(key-event-F? event 10) (send "\x1b;[21~")]
+          [(key-event-F? event 11) (send "\x1b;[23~")]
+          [(key-event-F? event 12) (send "\x1b;[24~")]
           [(mouse-event? event) (%forward-mouse! state event)]
           [(not (key-event? event)) event-result/ignore]
 
           ;; ctrl-chars: decode the byte the terminal actually sent via the
-          ;; crossterm table above, and a charless ctrl-key (ctrl+F1) falls
-          ;; through to the close below rather than erroring on char->integer
+          ;; crossterm table above; a charless ctrl-key (ctrl+F1) reaches the
+          ;; else branch below instead of erroring on char->integer
           [(and (key-event? event)
               (key-event-char event)
               (not (= (bitwise-and (key-event-modifier event) key-modifier-ctrl) 0)))
@@ -423,10 +444,8 @@
           [(key-event-char event)
             (send-char (key-event-char event))]
           [else
-            ;; Unforwardable keys (F-keys, Home/End, NUL...) close the overlay.
-            (split-overlay-close! "open-tool")
-            (set-status! "open-tool: closed by an unforwardable key")
-            event-result/close]))]))
+            (set-status! "open-tool: key not sent to the program")
+            event-result/consume]))]))
 
 ;; ------------------------------------------------------------------ command
 
@@ -442,7 +461,9 @@
 ;; child keeps running, so the program is resumed by pressing the chord again.
 ;;
 ;; Mouse press/release and wheel go to the program; drag does not.
-;; An unforwardable key (F-keys, Home/End) closes the overlay.
+;; F-keys and Home/End reach the program. A key that cannot be forwarded,
+;; such as a lock key or print screen, is reported in the status line.
+;; The tool stays open.
 ;;
 ;; #### Arguments
 ;; - `program` (`string?`) - executable name or path. If it contains `/`, treated
@@ -484,11 +505,11 @@
               (lambda (state event) (%handle-event! state event))
               (lambda (state rect) (%cursor! state rect))
 
-              ;; Single close hook: every path ends here (pump EOF, unforwardable
-              ;; key, close-tool, kill-switch, split-overlay's anchor-gone hook,
-              ;; which bypasses %handle-event!). Restoring the word here keeps
-              ;; TOOL from surviving child exit; killing the child ends the read
-              ;; loop. close! calls the thunk bare, so it closes over tool.
+              ;; Single close hook: every path ends here (pump EOF, close-tool,
+              ;; kill-switch, split-overlay's anchor-gone hook, which bypasses
+              ;; %handle-event!). Restoring the word here keeps TOOL from
+              ;; surviving child exit; killing the child ends the read loop.
+              ;; close! calls the thunk bare, so it closes over tool.
               (lambda ()
                 (%tool-mode-off!)
                 (kill-pty-process! (Tool-pty tool))))
