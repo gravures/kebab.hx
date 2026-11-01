@@ -144,10 +144,9 @@ impl PtyProcess {
 
     // TODO: Replace this with a proper result rather than a bool
     pub fn send_command_char(&mut self, command: char) -> bool {
-        self.command_sender
-            .send(command as u8)
-            .map(|_| true)
-            .unwrap_or(false)
+        let mut buf = [0u8; 4];
+
+        self.send_command(command.encode_utf8(&mut buf))
     }
 
     // TODO: Replace this with a proper result rather than a bool
@@ -1164,7 +1163,9 @@ impl VirtualTerminal {
     }
 
     fn advance_bytes_char(&mut self, bytes: char) {
-        self.terminal.advance_bytes([bytes as u8])
+        let mut buf = [0u8; 4];
+
+        self.terminal.advance_bytes(bytes.encode_utf8(&mut buf));
     }
 
     fn advance_bytes_with_carriage_return(&mut self, bytes: &str) {
