@@ -1229,3 +1229,121 @@ impl VirtualTerminal {
         self.terminal.cursor_pos().y as isize
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Drain the PTY output channel until it stays quiet, or the deadline passes.
+    fn collect_output(pty: &PtyProcess, timeout: Duration) -> String {
+        let deadline = Instant::now() + timeout;
+        let mut out = String::new();
+        let mut last_data = Instant::now();
+
+        while Instant::now() < deadline {
+            let mut got_data = false;
+
+            if let Some(mut guard) = pty.async_receiver.try_lock() {
+                while let Ok(chunk) = guard.try_recv() {
+                    out.push_str(&chunk);
+                    got_data = true;
+                }
+            }
+
+            if got_data {
+                last_data = Instant::now();
+            } else if !out.is_empty() && last_data.elapsed() > Duration::from_millis(200) {
+                break;
+            }
+
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        out
+    }
+
+    fn make_virtual_terminal() -> VirtualTerminal {
+        VirtualTerminal {
+            terminal: Terminal::new(
+                wezterm_term::TerminalSize::default(),
+                Arc::new(TermConfig::new()),
+                "bash",
+                "0.1.0",
+                Box::new(std::io::empty()),
+            ),
+            screen_iterator: ScreenCellIterator { x: 0, y: 0 },
+            scroll_up_modifier: 0,
+            last_cell: None,
+            last_reverse: false,
+            run_x: 0,
+            run_y: 0,
+        }
+    }
+
+    fn cell_string(term: &mut VirtualTerminal, x: usize, y: i32) -> Option<String> {
+        term.terminal
+            .screen_mut()
+            .get_cell_scrollback(x, y)
+            .map(|cell| cell.str().to_string())
+    }
+
+    /// ISS-001: a printable non-ASCII key must reach the PTY as UTF-8.
+    #[cfg(unix)]
+    #[test]
+    fn send_command_char_sends_multibyte_as_utf8() {
+        let mut pty = spawn_in_pty(CommandBuilder::new("/bin/cat"));
+
+        assert!(pty.send_command_char('é'));
+
+        let out = collect_output(&pty, Duration::from_secs(5));
+
+        // The tty echoes the input back, so the stream may hold the glyph twice.
+        // What matters: the bytes are valid UTF-8 and decode to the right glyph.
+        assert!(
+            out.contains('é'),
+            "expected 'é' in PTY output, got {:?}",
+            out
+        );
+        assert!(
+            !out.contains('\u{FFFD}'),
+            "expected valid UTF-8, got replacement chars in {:?}",
+            out
+        );
+
+        // ASCII stays one byte.
+        assert!(pty.send_command_char('a'));
+
+        let ascii = collect_output(&pty, Duration::from_secs(5));
+
+        assert!(ascii.contains('a'), "expected 'a' in PTY output, got {:?}", ascii);
+    }
+
+    /// ISS-002: non-ASCII output from the child must render as the right glyph.
+    #[test]
+    fn advance_bytes_char_keeps_multibyte_glyph() {
+        let mut term = make_virtual_terminal();
+
+        term.advance_bytes_char('€');
+
+        assert_eq!(
+            cell_string(&mut term, 0, 0).as_deref(),
+            Some("€"),
+            "expected the '€' glyph in cell (0,0)"
+        );
+    }
+
+    /// AC-3: ASCII output is unaffected by the encoding fix.
+    #[test]
+    fn advance_bytes_char_keeps_ascii_glyph() {
+        let mut term = make_virtual_terminal();
+
+        term.advance_bytes_char('a');
+
+        assert_eq!(
+            cell_string(&mut term, 0, 0).as_deref(),
+            Some("a"),
+            "expected the 'a' glyph in cell (0,0)"
+        );
+    }
+}
