@@ -7,6 +7,7 @@ use abi_stable::{
     RMut,
 };
 use config::{ColorAttribute, SrgbaTuple, TermConfig};
+use parking_lot::Mutex;
 use portable_pty::{
     Child, CommandBuilder, MasterPty, NativePtySystem, PtyPair, PtySize, PtySystem,
 };
@@ -32,23 +33,13 @@ use tokio::sync::mpsc;
 
 #[derive(Clone)]
 pub(crate) struct WriterWrapper {
-    writer: Arc<parking_lot::Mutex<Box<dyn Write + Send>>>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
 }
-
-// Note: This is no bueno, but we'll need this for now
-// until we figure out how to relax some of the constraints. I'm guessing
-// that the FFI layer probably just needs to use Mutex instead of RwLock
-// to avoid the Sync problem.
-unsafe impl Send for PtyProcess {}
-unsafe impl Sync for PtyProcess {}
-
-unsafe impl Send for VirtualTerminal {}
-unsafe impl Sync for VirtualTerminal {}
 
 impl WriterWrapper {
     pub fn new(writer: Box<dyn Write + Send>) -> Self {
         Self {
-            writer: Arc::new(parking_lot::Mutex::new(writer)),
+            writer: Arc::new(Mutex::new(writer)),
         }
     }
 }
@@ -66,13 +57,13 @@ impl std::io::Write for WriterWrapper {
 struct PtyProcess {
     cancellation_token_sender: Sender<()>,
     command_sender: Sender<u8>,
-    async_receiver: Arc<Mutex<mpsc::UnboundedReceiver<String>>>,
-    master: Box<dyn MasterPty + Send>,
+    async_receiver: Arc<AsyncMutex<mpsc::UnboundedReceiver<String>>>,
+    master: Mutex<Box<dyn MasterPty + Send>>,
     child: Box<dyn Child + Send + Sync + 'static>,
     writer: WriterWrapper,
 }
 
-use futures::{future::Either, lock::Mutex, FutureExt};
+use futures::{future::Either, lock::Mutex as AsyncMutex, FutureExt};
 
 // #[derive(Clone)]
 // struct TermAction(Action);
@@ -130,6 +121,7 @@ fn guard_ffi<T: IntoFFIVal>(
     name: &'static str,
     f: impl FnOnce() -> T,
 ) -> RResult<FFIValue, RBoxError> {
+    // SAFETY: `AssertUnwindSafe` accepts that a panic in `f` can leave the state it captured inconsistent.
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f().into_ffi_val())) {
         Ok(result) => result,
         Err(payload) => RResult::RErr(RBoxError::new(PanicError::new(name, payload))),
@@ -164,7 +156,7 @@ impl PtyProcess {
     // and those bounds checks should be implemented on
     // the conversion
     pub fn resize(&mut self, rows: usize, cols: usize) -> RResult<FFIValue, RBoxError> {
-        match self.master.resize(PtySize {
+        match self.master.lock().resize(PtySize {
             rows: rows as u16,
             cols: cols as u16,
             pixel_width: 0,
@@ -179,6 +171,7 @@ impl PtyProcess {
     pub fn async_try_read_line(&mut self) -> FfiFuture<RResult<FFIValue, RBoxError>> {
         let ar = Arc::clone(&self.async_receiver);
 
+        // SAFETY: `AssertUnwindSafe` accepts that a panic can discard the partially filled buffer.
         std::panic::AssertUnwindSafe(async move {
             let mut guard = ar.lock().await;
 
@@ -225,6 +218,7 @@ impl PtyProcess {
                 }
             }
         })
+        // SAFETY: the future is wrapped in `AssertUnwindSafe`, so it satisfies the `UnwindSafe` bound.
         .catch_unwind()
         .map(|result| match result {
             Ok(value) => value,
@@ -313,13 +307,13 @@ fn create_module() -> FFIModule {
         )
         .register_fn("virtual-terminal", |pty: &mut PtyProcess| {
             guard_ffi("virtual-terminal", move || VirtualTerminal {
-                terminal: Terminal::new(
+                terminal: Mutex::new(Terminal::new(
                     wezterm_term::TerminalSize::default(),
                     Arc::new(TermConfig::new()),
                     "bash",
                     "0.1.0",
                     Box::new(pty.writer.clone()),
-                ),
+                )),
                 screen_iterator: ScreenCellIterator { x: 0, y: 0 },
                 last_cell: None,
                 last_reverse: false,
@@ -331,13 +325,13 @@ fn create_module() -> FFIModule {
         // Raw virtual terminal!
         .register_fn("raw-virtual-terminal", || {
             guard_ffi("raw-virtual-terminal", move || VirtualTerminal {
-                terminal: Terminal::new(
+                terminal: Mutex::new(Terminal::new(
                     wezterm_term::TerminalSize::default(),
                     Arc::new(TermConfig::new()),
                     "bash",
                     "0.1.0",
                     Box::new(std::io::empty()),
-                ),
+                )),
                 screen_iterator: ScreenCellIterator { x: 0, y: 0 },
                 last_cell: None,
                 last_reverse: false,
@@ -490,27 +484,35 @@ fn create_module() -> FFIModule {
         // rather than arbitrarily stepping forward one step.
         .register_fn("vte/advance-iterator!", |term: &mut VirtualTerminal| {
             guard_ffi("vte/advance-iterator!", move || {
-                let size = term.terminal.get_size();
-
-                let (rows, cols) = (size.rows as i64 + term.scroll_up_modifier, size.cols);
+                let scroll_up_modifier = term.scroll_up_modifier;
+                let (rows, cols) = term.with_term(|terminal| {
+                    let size = terminal.get_size();
+                    (size.rows as i64 + scroll_up_modifier, size.cols)
+                });
 
                 if term.screen_iterator.x < cols && term.screen_iterator.y < rows {
-                    term.last_cell = term
-                        .terminal
-                        .screen_mut()
-                        .get_cell_scrollback(term.screen_iterator.x, term.screen_iterator.y as _)
-                        .cloned();
+                    let x = term.screen_iterator.x;
+                    let y = term.screen_iterator.y;
+                    term.last_cell = term.with_term(|terminal| {
+                        terminal
+                            .screen_mut()
+                            .get_cell_scrollback(x, y as _)
+                            .cloned()
+                    });
 
                     term.screen_iterator.x += 1;
                     return true;
                 }
 
                 if term.screen_iterator.x >= cols && term.screen_iterator.y < rows {
-                    term.last_cell = term
-                        .terminal
-                        .screen_mut()
-                        .get_cell_scrollback(term.screen_iterator.x, term.screen_iterator.y as _)
-                        .cloned();
+                    let x = term.screen_iterator.x;
+                    let y = term.screen_iterator.y;
+                    term.last_cell = term.with_term(|terminal| {
+                        terminal
+                            .screen_mut()
+                            .get_cell_scrollback(x, y as _)
+                            .cloned()
+                    });
 
                     term.screen_iterator.x = 0;
                     term.screen_iterator.y += 1;
@@ -526,21 +528,27 @@ fn create_module() -> FFIModule {
             "vte/advance-iterator-until-string!",
             |term: &mut VirtualTerminal| {
                 guard_ffi("vte/advance-iterator-until-string!", move || {
-                    let size = term.terminal.get_size();
-
-                    let (rows, cols) = (size.rows as i64 + term.scroll_up_modifier, size.cols);
+                    let scroll_up_modifier = term.scroll_up_modifier;
+                    let (rows, cols) = term.with_term(|terminal| {
+                        let size = terminal.get_size();
+                        (size.rows as i64 + scroll_up_modifier, size.cols)
+                    });
 
                     loop {
                         if term.screen_iterator.x < cols && term.screen_iterator.y < rows {
-                            let last_cell = term.terminal.screen_mut().get_cell_scrollback(
-                                term.screen_iterator.x,
-                                term.screen_iterator.y as _,
-                            );
+                            let x = term.screen_iterator.x;
+                            let y = term.screen_iterator.y;
+                            let last_cell = term.with_term(|terminal| {
+                                terminal
+                                    .screen_mut()
+                                    .get_cell_scrollback(x, y as _)
+                                    .cloned()
+                            });
 
                             term.screen_iterator.x += 1;
 
                             if last_cell.is_some() {
-                                term.last_cell = last_cell.cloned();
+                                term.last_cell = last_cell;
                                 return true;
                             } else {
                                 continue;
@@ -548,16 +556,20 @@ fn create_module() -> FFIModule {
                         }
 
                         if term.screen_iterator.x >= cols && term.screen_iterator.y < rows {
-                            let last_cell = term.terminal.screen_mut().get_cell_scrollback(
-                                term.screen_iterator.x,
-                                term.screen_iterator.y as _,
-                            );
+                            let x = term.screen_iterator.x;
+                            let y = term.screen_iterator.y;
+                            let last_cell = term.with_term(|terminal| {
+                                terminal
+                                    .screen_mut()
+                                    .get_cell_scrollback(x, y as _)
+                                    .cloned()
+                            });
 
                             term.screen_iterator.x = 0;
                             term.screen_iterator.y += 1;
 
                             if last_cell.is_some() {
-                                term.last_cell = last_cell.cloned();
+                                term.last_cell = last_cell;
                                 return true;
                             } else {
                                 continue;
@@ -575,26 +587,32 @@ fn create_module() -> FFIModule {
                 guard_ffi(
                     "vte/advance-iterator-and-update-cells!",
                     move || {
-                        let size = term.terminal.get_size();
-
-                        let (rows, cols) = (size.rows as i64 + term.scroll_up_modifier, size.cols);
+                        let scroll_up_modifier = term.scroll_up_modifier;
+                        let (rows, cols) = term.with_term(|terminal| {
+                            let size = terminal.get_size();
+                            (size.rows as i64 + scroll_up_modifier, size.cols)
+                        });
 
                         loop {
                             if term.screen_iterator.x < cols && term.screen_iterator.y < rows {
-                                let last_cell = term.terminal.screen_mut().get_cell_scrollback(
-                                    term.screen_iterator.x,
-                                    term.screen_iterator.y as _,
-                                );
+                                let x = term.screen_iterator.x;
+                                let y = term.screen_iterator.y;
+                                let last_cell = term.with_term(|terminal| {
+                                    terminal
+                                        .screen_mut()
+                                        .get_cell_scrollback(x, y as _)
+                                        .cloned()
+                                });
 
                                 term.screen_iterator.x += 1;
 
                                 if let Some(cell) = last_cell {
                                     // term.last_cell = last_cell.cloned();
-                                    if is_invisible(cell) {
+                                    if is_invisible(&cell) {
                                         continue;
                                     }
                                     term.last_reverse = cell.attrs().reverse();
-                                    update_cell(cell, mut_str, bg, fg);
+                                    update_cell(&cell, mut_str, bg, fg);
 
                                     return true;
                                 } else {
@@ -603,21 +621,25 @@ fn create_module() -> FFIModule {
                             }
 
                             if term.screen_iterator.x >= cols && term.screen_iterator.y < rows {
-                                let last_cell = term.terminal.screen_mut().get_cell_scrollback(
-                                    term.screen_iterator.x,
-                                    term.screen_iterator.y as _,
-                                );
+                                let x = term.screen_iterator.x;
+                                let y = term.screen_iterator.y;
+                                let last_cell = term.with_term(|terminal| {
+                                    terminal
+                                        .screen_mut()
+                                        .get_cell_scrollback(x, y as _)
+                                        .cloned()
+                                });
 
                                 term.screen_iterator.x = 0;
                                 term.screen_iterator.y += 1;
 
                                 if let Some(cell) = last_cell {
                                     // term.last_cell = last_cell.cloned();
-                                    if is_invisible(cell) {
+                                    if is_invisible(&cell) {
                                         continue;
                                     }
                                     term.last_reverse = cell.attrs().reverse();
-                                    update_cell(cell, mut_str, bg, fg);
+                                    update_cell(&cell, mut_str, bg, fg);
 
                                     return true;
                                 } else {
@@ -643,8 +665,11 @@ fn create_module() -> FFIModule {
             "vte/advance-run!",
             |term: &mut VirtualTerminal, mut mut_str: RMut<'_, RString>, bg: FFIArg, fg: FFIArg| {
                 guard_ffi("vte/advance-run!", move || {
-                    let size = term.terminal.get_size();
-                    let (rows, cols) = (size.rows as i64 + term.scroll_up_modifier, size.cols);
+                    let scroll_up_modifier = term.scroll_up_modifier;
+                    let (rows, cols) = term.with_term(|terminal| {
+                        let size = terminal.get_size();
+                        (size.rows as i64 + scroll_up_modifier, size.cols)
+                    });
 
                     // Find the next visible cell, same walk as the per-cell variant.
                     let first = loop {
@@ -656,13 +681,17 @@ fn create_module() -> FFIModule {
                             term.screen_iterator.y += 1;
                             continue;
                         }
-                        let cell = term.terminal.screen_mut().get_cell_scrollback(
-                            term.screen_iterator.x,
-                            term.screen_iterator.y as _,
-                        );
+                        let x = term.screen_iterator.x;
+                        let y = term.screen_iterator.y;
+                        let cell = term.with_term(|terminal| {
+                            terminal
+                                .screen_mut()
+                                .get_cell_scrollback(x, y as _)
+                                .cloned()
+                        });
                         term.screen_iterator.x += 1;
                         match cell {
-                            Some(cell) if !is_invisible(cell) => break cell.clone(),
+                            Some(cell) if !is_invisible(&cell) => break cell,
                             _ => continue,
                         }
                     };
@@ -679,13 +708,17 @@ fn create_module() -> FFIModule {
 
                     // Extend while cells stay visible and share (fg, bg, reverse).
                     while term.screen_iterator.x < cols {
-                        let cell = term.terminal.screen_mut().get_cell_scrollback(
-                            term.screen_iterator.x,
-                            term.screen_iterator.y as _,
-                        );
+                        let x = term.screen_iterator.x;
+                        let y = term.screen_iterator.y;
+                        let cell = term.with_term(|terminal| {
+                            terminal
+                                .screen_mut()
+                                .get_cell_scrollback(x, y as _)
+                                .cloned()
+                        });
                         match cell {
                             Some(cell)
-                                if !is_invisible(cell)
+                                if !is_invisible(&cell)
                                     && cell.attrs().foreground() == attrs.foreground()
                                     && cell.attrs().background() == attrs.background()
                                     && cell.attrs().reverse() == attrs.reverse() =>
@@ -904,8 +937,9 @@ fn create_module() -> FFIModule {
         )
         .register_fn("vte/scroll-up", |term: &mut VirtualTerminal| {
             guard_ffi("vte/scroll-up", move || {
-                term.scroll_up_modifier = (term.scroll_up_modifier - 1)
-                    .max(0 - term.terminal.screen().scrollback_rows() as i64);
+                let scrollback_rows =
+                    term.with_term(|terminal| terminal.screen().scrollback_rows()) as i64;
+                term.scroll_up_modifier = (term.scroll_up_modifier - 1).max(0 - scrollback_rows);
             })
         })
         .register_fn("vte/scroll-down", |term: &mut VirtualTerminal| {
@@ -1108,8 +1142,8 @@ fn spawn_in_pty(mut cmd: CommandBuilder) -> PtyProcess {
         cancellation_token_sender,
         command_sender,
         // output_receiver: rx,
-        async_receiver: Arc::new(Mutex::new(async_receiver)),
-        master,
+        async_receiver: Arc::new(AsyncMutex::new(async_receiver)),
+        master: Mutex::new(master),
         child,
         writer: writer_clone,
     }
@@ -1121,7 +1155,7 @@ fn spawn_in_pty(mut cmd: CommandBuilder) -> PtyProcess {
 // Get back this terminal in a way that rendering
 // is reasonably easy.
 struct VirtualTerminal {
-    terminal: wezterm_term::Terminal,
+    terminal: Mutex<Terminal>,
     screen_iterator: ScreenCellIterator,
     scroll_up_modifier: i64,
     last_cell: Option<Cell>,
@@ -1157,15 +1191,21 @@ impl TermLine {
 impl Custom for TermLine {}
 
 impl VirtualTerminal {
+    // Run `f` with exclusive access to the guarded terminal.
+    fn with_term<R>(&mut self, f: impl FnOnce(&mut Terminal) -> R) -> R {
+        let mut guard = self.terminal.lock();
+        f(&mut guard)
+    }
+
     // Keep track of the state of the terminal
     fn advance_bytes(&mut self, bytes: &str) {
-        self.terminal.advance_bytes(bytes)
+        self.with_term(|terminal| terminal.advance_bytes(bytes));
     }
 
     fn advance_bytes_char(&mut self, bytes: char) {
         let mut buf = [0u8; 4];
 
-        self.terminal.advance_bytes(bytes.encode_utf8(&mut buf));
+        self.with_term(|terminal| terminal.advance_bytes(bytes.encode_utf8(&mut buf)));
     }
 
     fn advance_bytes_with_carriage_return(&mut self, bytes: &str) {
@@ -1173,43 +1213,47 @@ impl VirtualTerminal {
 
         for char in bytes.chars() {
             match char {
-                '\n' => self.terminal.advance_bytes([b'\n', b'\r']),
-                c => self.terminal.advance_bytes(c.encode_utf8(&mut buf)),
+                '\n' => self.with_term(|terminal| terminal.advance_bytes([b'\n', b'\r'])),
+                c => self.with_term(|terminal| terminal.advance_bytes(c.encode_utf8(&mut buf))),
             }
         }
     }
 
     // Resizes the terminal
     fn resize(&mut self, rows: usize, cols: usize) {
-        self.terminal.resize(wezterm_term::TerminalSize {
-            rows: rows as _,
-            cols: cols as _,
-            pixel_width: 0,
-            pixel_height: 0,
-            dpi: 0,
+        self.with_term(|terminal| {
+            terminal.resize(wezterm_term::TerminalSize {
+                rows: rows as _,
+                cols: cols as _,
+                pixel_width: 0,
+                pixel_height: 0,
+                dpi: 0,
+            })
         });
     }
 
     // Get the content to render
     fn lines(&mut self) -> Vec<FFIValue> {
-        let screen = self.terminal.screen();
+        self.with_term(|terminal| {
+            let screen = terminal.screen();
 
-        let rows = screen.physical_rows;
+            let rows = screen.physical_rows;
 
-        let phys_row_start = screen.phys_row(0);
-        let phys_row_end = screen.phys_row(rows as i64);
+            let phys_row_start = screen.phys_row(0);
+            let phys_row_end = screen.phys_row(rows as i64);
 
-        screen
-            .lines_in_phys_range(phys_row_start..phys_row_end)
-            .into_iter()
-            .map(|line| TermLine { line }.into_ffi_val().unwrap())
-            .collect()
+            screen
+                .lines_in_phys_range(phys_row_start..phys_row_end)
+                .into_iter()
+                .map(|line| TermLine { line }.into_ffi_val().unwrap())
+                .collect()
+        })
 
         // let lines = screen.lines_in_phys_range()
     }
 
     fn cursor(&self) -> Vec<FFIValue> {
-        let pos = self.terminal.cursor_pos();
+        let pos = self.terminal.lock().cursor_pos();
 
         vec![
             pos.x.into_ffi_val().unwrap(),
@@ -1219,15 +1263,15 @@ impl VirtualTerminal {
 
     fn cursor_visible(&self) -> bool {
         use wezterm_surface::CursorVisibility;
-        self.terminal.cursor_pos().visibility == CursorVisibility::Visible
+        self.terminal.lock().cursor_pos().visibility == CursorVisibility::Visible
     }
 
     fn cursor_x(&self) -> usize {
-        self.terminal.cursor_pos().x
+        self.terminal.lock().cursor_pos().x
     }
 
     fn cursor_y(&self) -> isize {
-        self.terminal.cursor_pos().y as isize
+        self.terminal.lock().cursor_pos().y as isize
     }
 }
 
@@ -1266,13 +1310,13 @@ mod tests {
 
     fn make_virtual_terminal() -> VirtualTerminal {
         VirtualTerminal {
-            terminal: Terminal::new(
+            terminal: Mutex::new(Terminal::new(
                 wezterm_term::TerminalSize::default(),
                 Arc::new(TermConfig::new()),
                 "bash",
                 "0.1.0",
                 Box::new(std::io::empty()),
-            ),
+            )),
             screen_iterator: ScreenCellIterator { x: 0, y: 0 },
             scroll_up_modifier: 0,
             last_cell: None,
@@ -1283,10 +1327,12 @@ mod tests {
     }
 
     fn cell_string(term: &mut VirtualTerminal, x: usize, y: i32) -> Option<String> {
-        term.terminal
-            .screen_mut()
-            .get_cell_scrollback(x, y)
-            .map(|cell| cell.str().to_string())
+        term.with_term(|terminal| {
+            terminal
+                .screen_mut()
+                .get_cell_scrollback(x, y)
+                .map(|cell| cell.str().to_string())
+        })
     }
 
     /// ISS-001: a printable non-ASCII key must reach the PTY as UTF-8.
