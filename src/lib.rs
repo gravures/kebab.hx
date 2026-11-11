@@ -31,6 +31,8 @@ use wezterm_term::{Cell, Line, Terminal};
 
 use tokio::sync::mpsc;
 
+mod scan;
+
 #[derive(Clone)]
 pub(crate) struct WriterWrapper {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
@@ -320,6 +322,7 @@ fn create_module() -> FFIModule {
                 run_x: 0,
                 run_y: 0,
                 scroll_up_modifier: 0,
+                scanner: scan::EscapeScanner::new(),
             })
         })
         // Raw virtual terminal!
@@ -338,6 +341,7 @@ fn create_module() -> FFIModule {
                 run_x: 0,
                 run_y: 0,
                 scroll_up_modifier: 0,
+                scanner: scan::EscapeScanner::new(),
             })
         })
         .register_fn("vte/advance-bytes", |term: &mut VirtualTerminal, bytes: &str| {
@@ -1162,6 +1166,9 @@ struct VirtualTerminal {
     last_reverse: bool,
     run_x: usize,
     run_y: i64,
+    // ISS-039: swallows kitty-graphics and sixel sequences before the
+    // emulator, which would divide by zero placing an image.
+    scanner: scan::EscapeScanner,
 }
 
 struct ScreenCellIterator {
@@ -1199,23 +1206,38 @@ impl VirtualTerminal {
 
     // Keep track of the state of the terminal
     fn advance_bytes(&mut self, bytes: &str) {
-        self.with_term(|terminal| terminal.advance_bytes(bytes));
+        let scanned = self.scanner.feed(bytes.as_bytes());
+        if scanned.is_empty() {
+            return;
+        }
+
+        self.with_term(|terminal| terminal.advance_bytes(scanned));
     }
 
     fn advance_bytes_char(&mut self, bytes: char) {
         let mut buf = [0u8; 4];
+        let scanned = self.scanner.feed(bytes.encode_utf8(&mut buf).as_bytes());
+        if scanned.is_empty() {
+            return;
+        }
 
-        self.with_term(|terminal| terminal.advance_bytes(bytes.encode_utf8(&mut buf)));
+        self.with_term(|terminal| terminal.advance_bytes(scanned));
     }
 
     fn advance_bytes_with_carriage_return(&mut self, bytes: &str) {
         let mut buf = [0; 4];
 
         for char in bytes.chars() {
-            match char {
-                '\n' => self.with_term(|terminal| terminal.advance_bytes([b'\n', b'\r'])),
-                c => self.with_term(|terminal| terminal.advance_bytes(c.encode_utf8(&mut buf))),
+            let scanned = match char {
+                '\n' => self.scanner.feed(b"\n\r"),
+                c => self.scanner.feed(c.encode_utf8(&mut buf).as_bytes()),
+            };
+
+            if scanned.is_empty() {
+                continue;
             }
+
+            self.with_term(|terminal| terminal.advance_bytes(scanned));
         }
     }
 
@@ -1323,6 +1345,7 @@ mod tests {
             last_reverse: false,
             run_x: 0,
             run_y: 0,
+            scanner: scan::EscapeScanner::new(),
         }
     }
 
@@ -1333,6 +1356,13 @@ mod tests {
                 .get_cell_scrollback(x, y)
                 .map(|cell| cell.str().to_string())
         })
+    }
+
+    /// The first `width` cells of row 0, joined into one string.
+    fn line_text(term: &mut VirtualTerminal, width: usize) -> String {
+        (0..width)
+            .map(|x| cell_string(term, x, 0).unwrap_or_default())
+            .collect()
     }
 
     /// ISS-001: a printable non-ASCII key must reach the PTY as UTF-8.
@@ -1392,5 +1422,47 @@ mod tests {
             Some("a"),
             "expected the 'a' glyph in cell (0,0)"
         );
+    }
+
+    /// ISS-039: a kitty graphics sequence must not reach the emulator
+    /// (it would divide by zero) and must not leak payload onto the screen.
+    #[test]
+    fn advance_bytes_swallows_kitty_graphics() {
+        let mut term = make_virtual_terminal();
+
+        term.advance_bytes("\x1b_G a=T,f=24;AAAA\x1b\\hello");
+
+        assert_eq!(line_text(&mut term, 5), "hello");
+    }
+
+    /// ISS-039: sixel reaches the same divide-by-zero, so it is swallowed too.
+    #[test]
+    fn advance_bytes_swallows_sixel() {
+        let mut term = make_virtual_terminal();
+
+        term.advance_bytes("\x1bPq#0;2;0;0;0\x1b\\hello");
+
+        assert_eq!(line_text(&mut term, 5), "hello");
+    }
+
+    /// ISS-039: the sequence state must survive across FFI calls.
+    #[test]
+    fn advance_bytes_swallows_kitty_graphics_split_across_calls() {
+        let mut term = make_virtual_terminal();
+
+        term.advance_bytes("\x1b_G a=T,f=24;AA");
+        term.advance_bytes("AA\x1b\\hello");
+
+        assert_eq!(line_text(&mut term, 5), "hello");
+    }
+
+    /// AC-4: escapes that are not image sequences still reach the emulator.
+    #[test]
+    fn advance_bytes_keeps_other_escapes() {
+        let mut term = make_virtual_terminal();
+
+        term.advance_bytes("\x1b[2Jhello");
+
+        assert_eq!(line_text(&mut term, 5), "hello");
     }
 }
