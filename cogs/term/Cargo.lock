@@ -3219,8 +3219,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "steel-wezterm"
-version = "0.1.0"
+name = "steel-term"
+version = "0.0.0"
 dependencies = [
  "abi_stable",
  "anyhow",

@@ -117,9 +117,9 @@ The **tool** and **markdown** plugins use the `split-overlay.scm` module for pla
 - Closes automatically when the anchor document leaves the screen (closed or swapped out of every view)
 - Closes when the child process exits
 
-### Native library (steel-wezterm)
+### Native Rust Library (steel-term)
 
-Built from `wezterm-term` (fork branch `mwp-public-scroll`), exposing:
+Built from `wezterm-term`  exposing:
 
 - PTY spawn (`portable-pty`)
 - VT emulator (`wezterm-term`): parser, grid, cursor, scroll, colour attributes
