@@ -1,11 +1,10 @@
 [package]
-name = "steel-wezterm"
+name = "steel-term"
 version = "0.1.0"
 edition = "2021"
 
-
 [lib]
-name = "steel_wezterm"
+name = "steel_term"
 crate-type = ["cdylib"]
 
 [dependencies]

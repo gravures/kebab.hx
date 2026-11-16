@@ -1,6 +1,6 @@
 ;; Pull in all of the functions from the dylib.
 ;; See steel-pty for the definitions
-(#%require-dylib "libsteel_wezterm"
+(#%require-dylib "libsteel_term"
   (only-in create-native-pty-system!
     create-native-pty-system-with-cwd!
     create-native-pty-system-with-args-and-cwd!

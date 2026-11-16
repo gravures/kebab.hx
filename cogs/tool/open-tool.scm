@@ -19,11 +19,11 @@
 (require "helix/static.scm")
 (require "helix/editor.scm")
 (require "helix/configuration.scm")
-(require "split-overlay.scm")
+(require "kebab/overlay/split-overlay.scm")
 (require-builtin steel/ffi)
 (require-builtin steel/filesystem)
 
-(#%require-dylib "libsteel_wezterm"
+(#%require-dylib "libsteel_term"
   (only-in create-native-pty-system-with-args-and-cwd!
     kill-pty-process!
     pty-process-send-command
