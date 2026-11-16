@@ -7,13 +7,21 @@ skip_ci = "[skip ci]"
 skip_untracked = true
 tag_prefix = "v"
 
-pre_bump_hooks = ["sed -i '2s/.*/(define version \"{{version}}\")/'"]
+generate_mono_repository_global_tag = true
+generate_mono_repository_package_tags = true
+pre_bump_hooks = []
 post_bump_hooks = []
-
-generate_mono_repository_global_tag = false
-generate_mono_repository_package_tags = false
-pre_package_bump_hooks = []
+pre_package_bump_hooks = [
+  "sed -i '2s/.*/(define version \"{{version}}\")/' cog.scm",
+]
 post_package_bump_hooks = []
+
+[monorepo.packages]
+term = { path = "cogs/term" }
+overlay = { path = "cogs/overlay" }
+tool = { path = "cogs/tool" }
+md = { path = "cogs/md" }
+blame = { path = "cogs/blame" }
 
 [commit_types]
 # feat*, fix*,  security*, build, ci, revert, docs, test, style, chore, perf*
@@ -32,7 +40,7 @@ test = { changelog_title = "", omit_from_changelog = true }
 path = "CHANGELOG.md"
 authors = [{ username = "gravures", signature = "Gilles Coissac" }]
 remote = "github.com"
-repository = "term.hx"
+repository = "kebab.hx"
 owner = "gravures"
 template = "changelog.tera"
 
